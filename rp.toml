@@ -1,0 +1,12 @@
+role = "client"
+protocol = "tcp"
+listen_downstream_addr = ":8022"
+upstream_addr = "example.com:8022"
+log_level = "info"
+conn_pool_size = 8
+
+[[endpoints]]
+name = "ssh"
+protocol = "tcp"
+listen = ":22"
+target = "192.168.1.1:22"

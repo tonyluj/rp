@@ -1,0 +1,15 @@
+[Unit]
+Description=Reverse Proxy
+After=network-online.target.target
+
+[Service]
+Type=simple
+User=service
+Group=service
+WorkingDirectory=/home/service/rp
+ExecStart=/home/service/rp/rp -c rp.toml
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
