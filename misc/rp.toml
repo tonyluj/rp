@@ -1,12 +1,32 @@
 role = "client"
+log_level = "info"
+
+[server]
 protocol = "tcp"
 listen_downstream_addr = ":8022"
-upstream_addr = "example.com:8022"
-log_level = "info"
+
+[client]
 conn_pool_size = 8
 
-[[endpoints]]
+[[client.upstream]]
+name = "sh-tonylu-cloud"
+protocol = "tcp"
+addr = "example.com:8022"
+max_retries = 30 # -1 for infinity
+retry_interval = 5 # in secound
+endpoints = [ "*" ]  # registerd endpoint, "*" means all, empty is not allowed
+
+[[client.upstream]]
+name = "local"
+protocol = "tcp"
+addr = "example.com:8022"
+max_retries = 30
+retry_interval = 5
+endpoints = [ "ssh" ]  # registerd endpoint, "*" means all, empty is not allowed
+
+[[endpoint]]
 name = "ssh"
+mode = "downstream" # downstream or direct
 protocol = "tcp"
 listen = ":22"
 target = "192.168.1.1:22"

@@ -61,7 +61,7 @@ func (s *Server) Close() {
 }
 
 func (s *Server) initDownstreamListener() (err error) {
-	s.listener, err = net.Listen("tcp", s.config.ListenDownstreamAddr)
+	s.listener, err = net.Listen("tcp", s.config.Server.ListenDownstreamAddr)
 	if err != nil {
 		err = fmt.Errorf("server could not listen addr: %w", err)
 		return
@@ -91,7 +91,6 @@ func (s *Server) Run() (err error) {
 	}
 	go s.doDownstreamListener()
 
-	s.logger.Info("running")
 	var wg sync.WaitGroup
 	for _, cfg := range s.config.Endpoints {
 		wg.Add(1)
@@ -104,6 +103,7 @@ func (s *Server) Run() (err error) {
 			s.handleEndpoint(endpoint)
 		}(cfg)
 	}
+	s.logger.Info("running")
 	wg.Wait()
 	return
 }

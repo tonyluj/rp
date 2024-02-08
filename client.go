@@ -22,6 +22,12 @@ type RegisterDownstream struct {
 	Endpoints []string // slice of endpoint name
 }
 
+type Upstream struct {
+	mu     sync.Mutex
+	config *ClientUpstreamConfig
+	uc     []*UpstreamConn
+}
+
 type UpstreamConn struct {
 	Session *smux.Session
 	Conn    net.Conn
@@ -30,8 +36,8 @@ type UpstreamConn struct {
 
 type Client struct {
 	mu     sync.Mutex
+	us     map[string]*Upstream
 	config Config
-	uc     []*UpstreamConn
 	logger *slog.Logger
 	ce     map[string]*clientEndpoint
 }
@@ -43,7 +49,7 @@ type clientEndpoint struct {
 func NewClient(config Config, logger *slog.Logger) (client *Client) {
 	client = &Client{
 		config: config,
-		uc:     make([]*UpstreamConn, 0, 8),
+		us:     make(map[string]*Upstream, 8),
 		ce:     make(map[string]*clientEndpoint, 16),
 		logger: logger,
 	}
@@ -54,7 +60,7 @@ func (c *Client) initConn(protocol, addr string) (conn net.Conn, err error) {
 	var retries = ClientDialUpstreamMaxRetries
 
 	for retries > 0 {
-		conn, err = net.Dial("tcp", c.config.UpstreamAddr)
+		conn, err = net.Dial(protocol, addr)
 		if err != nil {
 			retries--
 			time.Sleep(ClientDialUpstreamRetryInterval)
@@ -69,53 +75,55 @@ func (c *Client) initConn(protocol, addr string) (conn net.Conn, err error) {
 	return
 }
 
-func (c *Client) initConnPool() (err error) {
-	for range c.config.ConnPoolSize {
-		uc := new(UpstreamConn)
-		uc.Conn, err = c.initConn("tcp", c.config.UpstreamAddr)
-		if err != nil {
-			err = fmt.Errorf("init conn pool error: %w", err)
-			return
-		}
-		uc.Session, err = smux.Server(uc.Conn, &smux.Config{
-			Version:           2,
-			KeepAliveDisabled: false,
-			KeepAliveInterval: time.Second * 15,
-			KeepAliveTimeout:  time.Second * 30,
-			MaxFrameSize:      32 * 1024,
-			MaxReceiveBuffer:  512 * 1024,
-			MaxStreamBuffer:   512 * 1024,
-		})
-		if err != nil {
-			err = fmt.Errorf("init conn pool error: %w", err)
-			return
-		}
+func (c *Client) initUpstreamConnPool() (err error) {
+	for _, up := range c.us {
+		up.uc = make([]*UpstreamConn, 0, c.config.Client.ConnPoolSize)
 
-		c.mu.Lock()
-		c.uc = append(c.uc, uc)
-		c.mu.Unlock()
+		for range c.config.Client.ConnPoolSize {
+			uc := new(UpstreamConn)
+			uc.Conn, err = c.initConn("tcp", up.config.Addr)
+			if err != nil {
+				err = fmt.Errorf("init conn pool error: %w", err)
+				return
+			}
+			uc.Session, err = smux.Server(uc.Conn, &smux.Config{
+				Version:           2,
+				KeepAliveDisabled: false,
+				KeepAliveInterval: time.Second * 15,
+				KeepAliveTimeout:  time.Second * 30,
+				MaxFrameSize:      32 * 1024,
+				MaxReceiveBuffer:  512 * 1024,
+				MaxStreamBuffer:   512 * 1024,
+			})
+			if err != nil {
+				err = fmt.Errorf("init conn pool error: %w", err)
+				return
+			}
+
+			up.mu.Lock()
+			up.uc = append(up.uc, uc)
+			up.mu.Unlock()
+		}
 	}
 	return
 }
 
 func (c *Client) registerEndpoint() (err error) {
-	es := make([]string, 0, len(c.ce))
-	for name := range c.ce {
-		es = append(es, name)
-	}
+	for _, up := range c.us {
+		req := RegisterDownstream{Endpoints: up.config.Endpoints}
 
-	req := RegisterDownstream{Endpoints: es}
-	c.mu.Lock()
-	for _, uc := range c.uc {
-		err = gob.NewEncoder(uc.Conn).Encode(req)
-		if err != nil {
-			err = fmt.Errorf("unable to register endpint: %w", err)
-			break
+		up.mu.Lock()
+		for _, uc := range up.uc {
+			err = gob.NewEncoder(uc.Conn).Encode(req)
+			if err != nil {
+				err = fmt.Errorf("unable to register endpint: %w", err)
+				break
+			}
+
+			c.logger.Debug("register done", "addr", uc.Conn.RemoteAddr())
 		}
-
-		c.logger.Debug("register done", "addr", uc.Conn.RemoteAddr())
+		up.mu.Unlock()
 	}
-	c.mu.Unlock()
 	return
 }
 
@@ -125,6 +133,16 @@ func (c *Client) initEndpoint() {
 			config: &cfg,
 		}
 		c.ce[cfg.Name] = ep
+	}
+	return
+}
+
+func (c *Client) initUpstream() {
+	for _, cu := range c.config.Client.Upstreams {
+		up := &Upstream{
+			config: &cu,
+		}
+		c.us[cu.Name] = up
 	}
 	return
 }
@@ -179,26 +197,29 @@ func (c *Client) handleUpstreamConn(uc *UpstreamConn) {
 }
 
 func (c *Client) Close() {
-	c.mu.Lock()
-	for _, uc := range c.uc {
-		err := uc.Conn.Close()
-		if err != nil {
-			c.logger.Error("close upstream error", "error", err)
-			continue
+	for _, up := range c.us {
+		up.mu.Lock()
+		for _, uc := range up.uc {
+			err := uc.Conn.Close()
+			if err != nil {
+				c.logger.Error("close upstream error", "error", err)
+				continue
+			}
+			err = uc.Session.Close()
+			if err != nil {
+				c.logger.Error("close upstream error", "error", err)
+				continue
+			}
 		}
-		err = uc.Session.Close()
-		if err != nil {
-			c.logger.Error("close upstream error", "error", err)
-			continue
-		}
+		up.mu.Unlock()
 	}
-	c.mu.Unlock()
 	return
 }
 
 func (c *Client) Run() (err error) {
 	c.initEndpoint()
-	err = c.initConnPool()
+	c.initUpstream()
+	err = c.initUpstreamConnPool()
 	if err != nil {
 		err = fmt.Errorf("run client error: %w", err)
 		return err
@@ -209,17 +230,19 @@ func (c *Client) Run() (err error) {
 		return err
 	}
 
-	c.logger.Info("running")
 	var wg sync.WaitGroup
-	for _, uc := range c.uc {
-		wg.Add(1)
+	for _, up := range c.us {
+		for _, uc := range up.uc {
+			wg.Add(1)
 
-		go func(uc *UpstreamConn) {
-			defer wg.Done()
+			go func(uc *UpstreamConn) {
+				defer wg.Done()
 
-			c.handleUpstreamConn(uc)
-		}(uc)
+				c.handleUpstreamConn(uc)
+			}(uc)
+		}
 	}
+	c.logger.Info("running")
 	wg.Wait()
 	return
 }
