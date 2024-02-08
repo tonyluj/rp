@@ -13,11 +13,6 @@ import (
 	"github.com/xtaci/smux"
 )
 
-const (
-	ClientDialUpstreamMaxRetries    = 15
-	ClientDialUpstreamRetryInterval = time.Second * 5
-)
-
 type RegisterDownstream struct {
 	Endpoints []string // slice of endpoint name
 }
@@ -26,6 +21,7 @@ type Upstream struct {
 	mu     sync.Mutex
 	config *ClientUpstreamConfig
 	uc     []*UpstreamConn
+	es     []string // endpoints
 }
 
 type UpstreamConn struct {
@@ -56,14 +52,14 @@ func NewClient(config Config, logger *slog.Logger) (client *Client) {
 	return
 }
 
-func (c *Client) initConn(protocol, addr string) (conn net.Conn, err error) {
-	var retries = ClientDialUpstreamMaxRetries
+func (c *Client) initConn(up *Upstream) (conn net.Conn, err error) {
+	var retries = up.config.MaxRetries
 
 	for retries > 0 {
-		conn, err = net.Dial(protocol, addr)
+		conn, err = net.Dial(up.config.Protocol, up.config.Addr)
 		if err != nil {
 			retries--
-			time.Sleep(ClientDialUpstreamRetryInterval)
+			time.Sleep(time.Duration(up.config.RetryInterval) * time.Second)
 			continue
 		}
 
@@ -81,7 +77,7 @@ func (c *Client) initUpstreamConnPool() (err error) {
 
 		for range c.config.Client.ConnPoolSize {
 			uc := new(UpstreamConn)
-			uc.Conn, err = c.initConn("tcp", up.config.Addr)
+			uc.Conn, err = c.initConn(up)
 			if err != nil {
 				err = fmt.Errorf("init conn pool error: %w", err)
 				return
@@ -141,6 +137,7 @@ func (c *Client) initUpstream() {
 	for _, cu := range c.config.Client.Upstreams {
 		up := &Upstream{
 			config: &cu,
+			es:     cu.Endpoints,
 		}
 		c.us[cu.Name] = up
 	}

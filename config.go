@@ -14,14 +14,24 @@ import (
 
 const (
 	DefaultConnPoolSize = 16
+
+	ClientDialUpstreamMaxRetries    = 15
+	ClientDialUpstreamRetryInterval = 5
+
+	RoleClient = "client"
+	RoleServer = "server"
+)
+
+var (
+	AvailableEndpointProtocol = []string{"tcp"}
 )
 
 type Config struct {
 	Role      string           `toml:"role"`
 	Endpoints []EndpointConfig `toml:"endpoint"`
 	LogLevel  string           `toml:"log_level"`
-	Server    ServerConfig     `toml:"server"`
-	Client    ClientConfig     `toml:"client"`
+	Server    *ServerConfig    `toml:"server"`
+	Client    *ClientConfig    `toml:"client"`
 }
 
 type ServerConfig struct {
@@ -108,11 +118,26 @@ func ParseConfig() (config Config, err error) {
 		err = fmt.Errorf("parse config error: %w", err)
 		return
 	}
-	if config.Client.ConnPoolSize == 0 {
-		config.Client.ConnPoolSize = DefaultConnPoolSize
-	}
+	// correct role
 	if role != "" {
 		config.Role = role
+	}
+	switch strings.ToLower(config.Role) {
+	case RoleClient, RoleServer:
+	default:
+		err = errors.New("unknown role")
+		return
+	}
+
+	// check log level
+	var (
+		ll  = parseLogLevel(logLevel)
+		cll = parseLogLevel(config.LogLevel)
+	)
+	if logLevel != "" {
+		defaultLogger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: ll}))
+	} else {
+		defaultLogger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cll}))
 	}
 
 	// check endpoints
@@ -127,27 +152,98 @@ func ParseConfig() (config Config, err error) {
 		err = fmt.Errorf("duplicated endpoints: %v", ds)
 		return
 	}
-	// check client upstream
-	if len(config.Client.Upstreams) <= 0 {
-		err = errors.New("no available client upstream")
+	lo.ForEach(config.Endpoints, func(enp EndpointConfig, _ int) {
+		if enp.Name == "" {
+			err = errors.New("empty endpoint name")
+			return
+		}
+		if enp.ListenAddr == "" || enp.TargetAddr == "" {
+			err = errors.New("empty endpoint addr")
+			return
+		}
+		if lo.IndexOf(AvailableEndpointProtocol, strings.ToLower(enp.Protocol)) == -1 {
+			err = fmt.Errorf("unknown protocol: %v", enp.Protocol)
+			return
+		}
 		return
-	}
-	// check upstream duplicate
-	if ds := lo.FindDuplicatesBy(config.Client.Upstreams, func(upstream ClientUpstreamConfig) (name string) {
-		return upstream.Name
-	}); len(ds) > 0 {
-		err = fmt.Errorf("duplicated upstream: %v", ds)
-		return
+	})
+
+	// check client config
+	if config.Role == RoleClient {
+		if config.Client == nil {
+			err = errors.New("role is client, but no client config found")
+			return
+		}
+		// correct conn pool size
+		if config.Client.ConnPoolSize <= 0 {
+			config.Client.ConnPoolSize = DefaultConnPoolSize
+		}
+		// check client upstream
+		if len(config.Client.Upstreams) <= 0 {
+			err = errors.New("no available client upstream")
+			return
+		}
+		// check upstream duplicate
+		if ds := lo.FindDuplicatesBy(config.Client.Upstreams, func(upstream ClientUpstreamConfig) (name string) {
+			return upstream.Name
+		}); len(ds) > 0 {
+			err = fmt.Errorf("duplicated upstream: %v", ds)
+			return
+		}
+		enps := lo.Map(config.Endpoints, func(enp EndpointConfig, _ int) string {
+			return enp.Name
+		})
+		for i := range config.Client.Upstreams {
+			up := &config.Client.Upstreams[i]
+
+			if up.Name == "" {
+				err = errors.New("empty upstream name")
+				return
+			}
+			if up.Addr == "" {
+				err = errors.New("empty upstream addr")
+				return
+			}
+			if lo.IndexOf(AvailableEndpointProtocol, strings.ToLower(up.Protocol)) == -1 {
+				err = errors.New("no available upstream protocol")
+				return
+			}
+			// correct retries
+			if up.MaxRetries == 0 {
+				up.MaxRetries = ClientDialUpstreamMaxRetries
+			}
+			if up.RetryInterval == 0 {
+				up.RetryInterval = ClientDialUpstreamRetryInterval
+			}
+			// check endpoints existed
+			up.Endpoints = lo.Uniq(up.Endpoints)
+			if len(up.Endpoints) == 1 && up.Endpoints[0] == "*" {
+				up.Endpoints = enps
+			} else {
+				lo.ForEach(up.Endpoints, func(enp string, _ int) {
+					if lo.IndexOf(enps, enp) == -1 {
+						err = fmt.Errorf("unknown upstream endpoint: %v", enp)
+						return
+					}
+				})
+			}
+		}
 	}
 
-	var (
-		ll  = parseLogLevel(logLevel)
-		cll = parseLogLevel(config.LogLevel)
-	)
-	if logLevel != "" {
-		defaultLogger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: ll}))
-	} else {
-		defaultLogger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cll}))
+	// check server
+	if config.Role == RoleServer {
+		if config.Server == nil {
+			err = errors.New("role is server, but no server config found")
+			return
+		}
+		if lo.IndexOf(AvailableEndpointProtocol, config.Server.Protocol) == -1 {
+			err = fmt.Errorf("unknown server protocol: %v", config.Server.Protocol)
+			return
+		}
+		if config.Server.ListenDownstreamAddr == "" {
+			err = errors.New("empty server listen addr")
+			return
+		}
 	}
 	return
 }
