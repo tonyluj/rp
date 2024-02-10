@@ -147,6 +147,12 @@ func (c *Client) initUpstream() {
 func (c *Client) handleUpstreamStream(uc *UpstreamConn, ss *smux.Stream) {
 	defer func() {
 		uc.ConnNum--
+
+		err := ss.Close()
+		if err != nil {
+			c.logger.Debug("close upstream stream error", "error", err)
+			return
+		}
 	}()
 
 	// handshake
@@ -161,16 +167,35 @@ func (c *Client) handleUpstreamStream(uc *UpstreamConn, ss *smux.Stream) {
 		c.logger.Error("unable to find available endpoint", "name", req.Name)
 		return
 	}
-	conn, err := net.Dial("tcp", enp.config.TargetAddr)
-	if err != nil {
-		c.logger.Error("unable to dial target", "error", err)
-		return
+
+	c.logger.Debug("handle request", "endpoint", enp.config.Name)
+
+	switch req.Op {
+	case ServerRequestOperationConnect:
+		conn, err := net.Dial("tcp", enp.config.TargetAddr)
+		if err != nil {
+			c.logger.Error("unable to dial target", "error", err)
+			return
+		}
+		defer func(conn net.Conn) {
+			err := conn.Close()
+			if err != nil {
+				c.logger.Debug("close upstream stream error", "error", err)
+				return
+			}
+		}(conn)
+
+		err = proxyConn(conn, ss)
+		if err != nil {
+			c.logger.Error("proxy conn error", "error", err)
+		}
+	case ServerRequestOperationTestBandwidth:
+		c.handleTestBandwidth(enp, ss)
+	default:
+		c.logger.Error("unknown server request operation", "error", ErrUnknownServerRequestOperation, "operation", req.Op)
 	}
-	c.logger.Debug("handle request", "endpoint", enp.config.Name, "remote_addr", conn.RemoteAddr())
 
-	proxyConn(conn, ss)
-
-	c.logger.Debug("handle request done", "endpoint", enp.config.Name, "remote_addr", conn.RemoteAddr())
+	c.logger.Debug("handle request done", "endpoint", enp.config.Name)
 	return
 }
 
@@ -242,4 +267,23 @@ func (c *Client) Run() (err error) {
 	c.logger.Info("running")
 	wg.Wait()
 	return
+}
+
+func (c *Client) handleTestBandwidth(endpoint *clientEndpoint, conn net.Conn) {
+	var (
+		buf       = make([]byte, 4096)
+		startTime = time.Now()
+	)
+	for {
+		// too long, stop it
+		if time.Now().Sub(startTime) > time.Minute {
+			break
+		}
+
+		_, err := conn.Read(buf)
+		if err != nil {
+			c.logger.Error("handle test bandwidth error", "error", err, "endpoint", endpoint.config.Name)
+			break
+		}
+	}
 }

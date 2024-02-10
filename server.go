@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -14,8 +15,18 @@ import (
 	"github.com/xtaci/smux"
 )
 
+type ServerRequestOperation uint8
+
+const (
+	ServerRequestOperationConnect       ServerRequestOperation = 0
+	ServerRequestOperationTestBandwidth ServerRequestOperation = 1
+)
+
+var ErrUnknownServerRequestOperation = errors.New("unknown server request operation")
+
 type ServerRequestEndpoint struct {
 	Name string
+	Op   ServerRequestOperation
 }
 
 type Server struct {
@@ -35,7 +46,8 @@ type downstreamConn struct {
 }
 
 type serverEndpoint struct {
-	config *EndpointConfig
+	config    *EndpointConfig
+	bandwidth uint64
 }
 
 func NewServer(config Config, logger *slog.Logger) (server *Server) {
@@ -161,7 +173,15 @@ func (s *Server) findAvailableDownstream(name string) (adc *downstreamConn) {
 	return
 }
 
-func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, conn net.Conn) {
+func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerRequestOperation, conn net.Conn) {
+	defer func(conn net.Conn) {
+		err := conn.Close()
+		if err != nil {
+			s.logger.Debug("close conn error", "error", err)
+			return
+		}
+	}(conn)
+
 	var (
 		adc *downstreamConn
 		dsc int32 = math.MaxInt32
@@ -196,10 +216,18 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, conn net.Conn) 
 		s.logger.Error("unable to setup downstream stream", "error", err)
 		return
 	}
+	defer func(ss *smux.Stream) {
+		err := ss.Close()
+		if err != nil {
+			s.logger.Debug("close stream error", "error", err)
+			return
+		}
+	}(ss)
 
 	// handshake
 	req := ServerRequestEndpoint{
 		Name: endpoint.config.Name,
+		Op:   op,
 	}
 	err = gob.NewEncoder(ss).Encode(req)
 	if err != nil {
@@ -207,7 +235,15 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, conn net.Conn) 
 		return
 	}
 
-	proxyConn(conn, ss)
+	switch op {
+	case ServerRequestOperationConnect:
+		err = proxyConn(conn, ss)
+		if err != nil {
+			s.logger.Error("proxy conn error", "error", err)
+		}
+	case ServerRequestOperationTestBandwidth:
+		s.testBandwidth(endpoint, ss)
+	}
 
 	s.logger.Debug("handle request done", "endpoint", endpoint.config.Name, "downstream_addr",
 		adc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
@@ -237,7 +273,7 @@ func (s *Server) handleEndpointTcp(endpoint *serverEndpoint) {
 			continue
 		}
 
-		go s.handleUpstreamTcpConn(endpoint, conn)
+		go s.handleUpstreamTcpConn(endpoint, ServerRequestOperationConnect, conn)
 	}
 }
 
@@ -251,4 +287,30 @@ func (s *Server) handleEndpoint(endpoint *serverEndpoint) {
 		// THIS SHOULD NEVER HAPPEN
 		s.logger.Error("unknown protocol", "protocol", endpoint.config.Protocol)
 	}
+}
+
+func (s *Server) testBandwidth(endpoint *serverEndpoint, conn net.Conn) {
+	var (
+		buf       = make([]byte, 4096)
+		startTime = time.Now()
+		costTime  time.Duration
+		written   uint64
+	)
+	for {
+		costTime := time.Now().Sub(startTime)
+		if costTime > time.Second*5 {
+			break
+		}
+
+		n, err := conn.Write(buf)
+		if err != nil {
+			s.logger.Error("test bandwidth error", "error", err)
+			return
+		}
+		if n > 0 {
+			written += uint64(n)
+		}
+	}
+	endpoint.bandwidth = uint64(float64(written) / costTime.Seconds())
+	return
 }

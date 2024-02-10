@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"sync"
 )
@@ -15,32 +16,21 @@ func init() {
 	}}
 }
 
-func proxyConn(dst, src io.ReadWriteCloser) {
-	defer func(dst io.ReadWriteCloser) {
-		err := dst.Close()
-		if err != nil {
-			return
-		}
-	}(dst)
-
+func proxyConn(dst, src io.ReadWriteCloser) (err error) {
 	go func() {
-		defer func(src io.ReadWriteCloser) {
-			err := src.Close()
-			if err != nil {
-				return
-			}
-		}(src)
-
-		_, err := copyBuffer(src, dst)
+		_, err = copyBuffer(src, dst)
 		if err != nil {
+			err = fmt.Errorf("proxy conn error: %w", err)
 			return
 		}
 	}()
 
-	_, err := copyBuffer(dst, src)
+	_, err = copyBuffer(dst, src)
 	if err != nil {
+		err = fmt.Errorf("proxy conn error: %w", err)
 		return
 	}
+	return
 }
 
 func copyBuffer(dst io.WriteCloser, src io.ReadCloser) (written int64, err error) {
