@@ -7,13 +7,14 @@ import (
 	"log/slog"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/xtaci/smux"
 )
 
 type RegisterDownstream struct {
+	UUID      [16]byte // for unique ID for server side
 	Endpoints []string // slice of endpoint name
 }
 
@@ -27,7 +28,6 @@ type Upstream struct {
 type UpstreamConn struct {
 	Session *smux.Session
 	Conn    net.Conn
-	ConnNum int32
 }
 
 type Client struct {
@@ -36,6 +36,7 @@ type Client struct {
 	config Config
 	logger *slog.Logger
 	ce     map[string]*clientEndpoint
+	uuid   uuid.UUID
 }
 
 type clientEndpoint struct {
@@ -43,11 +44,18 @@ type clientEndpoint struct {
 }
 
 func NewClient(config Config, logger *slog.Logger) (client *Client) {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		err = fmt.Errorf("new client error: %w", err)
+		return
+	}
+
 	client = &Client{
 		config: config,
 		us:     make(map[string]*Upstream, 8),
 		ce:     make(map[string]*clientEndpoint, 16),
 		logger: logger,
+		uuid:   id,
 	}
 	return
 }
@@ -106,7 +114,10 @@ func (c *Client) initUpstreamConnPool() (err error) {
 
 func (c *Client) registerEndpoint() (err error) {
 	for _, up := range c.us {
-		req := RegisterDownstream{Endpoints: up.config.Endpoints}
+		req := RegisterDownstream{
+			UUID:      c.uuid,
+			Endpoints: up.config.Endpoints,
+		}
 
 		up.mu.Lock()
 		for _, uc := range up.uc {
@@ -146,8 +157,6 @@ func (c *Client) initUpstream() {
 
 func (c *Client) handleUpstreamStream(uc *UpstreamConn, ss *smux.Stream) {
 	defer func() {
-		uc.ConnNum--
-
 		err := ss.Close()
 		if err != nil {
 			c.logger.Debug("close upstream stream error", "error", err)
@@ -185,7 +194,7 @@ func (c *Client) handleUpstreamStream(uc *UpstreamConn, ss *smux.Stream) {
 			}
 		}(conn)
 
-		err = proxyConn(conn, ss)
+		err = NewProxier(conn, ss).Proxy()
 		if err != nil {
 			c.logger.Error("proxy conn error", "error", err)
 		}
@@ -212,7 +221,6 @@ func (c *Client) handleUpstreamConn(uc *UpstreamConn) {
 			time.Sleep(time.Millisecond * 10)
 			continue
 		}
-		atomic.AddInt32(&uc.ConnNum, 1)
 
 		go c.handleUpstreamStream(uc, stream)
 	}

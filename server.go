@@ -9,10 +9,17 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/puzpuzpuz/xsync/v3"
+	"github.com/samber/lo"
 	"github.com/xtaci/smux"
+)
+
+const (
+	ServerCalculateBandwidthInterval    = time.Second * 30
+	ServerCalculateBandwidthCapDuration = time.Second * 3
 )
 
 type ServerRequestOperation uint8
@@ -24,6 +31,29 @@ const (
 
 var ErrUnknownServerRequestOperation = errors.New("unknown server request operation")
 
+type DownstreamSelectionStrategy uint8
+
+const (
+	DownstreamSelectionStrategyConn      DownstreamSelectionStrategy = 0 // select less connections number
+	DownstreamSelectionStrategyBandwidth DownstreamSelectionStrategy = 1 // select smaller current bandwidth
+)
+
+func (d DownstreamSelectionStrategy) String() string {
+	switch d {
+	case DownstreamSelectionStrategyConn:
+		return "conn"
+	case DownstreamSelectionStrategyBandwidth:
+		return "bandwidth"
+	default:
+		return "unknown"
+	}
+}
+
+var (
+	ErrUnknownDownstreamSelectionStrategy = errors.New("unknown downstream selection strategy")
+	ErrNoAvailableDownstream              = errors.New("no available downstream")
+)
+
 type ServerRequestEndpoint struct {
 	Name string
 	Op   ServerRequestOperation
@@ -32,40 +62,46 @@ type ServerRequestEndpoint struct {
 type Server struct {
 	mu       sync.Mutex
 	config   Config
-	dc       []*downstreamConn
+	ds       *xsync.MapOf[uuid.UUID, *downstream]
 	listener net.Listener
 	logger   *slog.Logger
-	se       *sync.Map
+	se       *xsync.MapOf[string, *serverEndpoint] // serverEndpoint
+}
+
+type downstream struct {
+	mu           sync.RWMutex
+	uuid         uuid.UUID
+	endpointName []string // registered endpoint name
+	dc           []*downstreamConn
+
+	bandwidthCap        int64     // cap, calculate by testBandWidth(), all connections shares
+	bandwidth           int64     // now, update every 15s
+	bandwidthLastUpdate time.Time // last update timestamp
 }
 
 type downstreamConn struct {
-	Session      *smux.Session
-	Conn         net.Conn
-	EndpointName []string // registered endpoint name
-	ConnNum      int32
+	ds      *downstream
+	Session *smux.Session
+	Conn    net.Conn
+	load    *xsync.Counter
+	proxier *Proxier
 }
 
 type serverEndpoint struct {
-	config    *EndpointConfig
-	bandwidth uint64
+	config *EndpointConfig
 }
 
 func NewServer(config Config, logger *slog.Logger) (server *Server) {
 	server = &Server{
 		config: config,
-		dc:     make([]*downstreamConn, 0, 8),
+		ds:     xsync.NewMapOf[uuid.UUID, *downstream](),
 		logger: logger,
-		se:     new(sync.Map),
+		se:     xsync.NewMapOf[string, *serverEndpoint](),
 	}
 	return
 }
 
 func (s *Server) Close() {
-	s.se.Range(func(_, v any) bool {
-		// TODO
-
-		return false
-	})
 	err := s.listener.Close()
 	if err != nil {
 		s.logger.Error("server close error", "error", err)
@@ -104,6 +140,10 @@ func (s *Server) Run() (err error) {
 	}
 	go s.doDownstreamListener()
 
+	if s.config.Server.DownstreamSelectionStrategy == DownstreamSelectionStrategyBandwidth.String() {
+		go s.calculateDownstreamBandwidth()
+	}
+
 	var wg sync.WaitGroup
 	for _, cfg := range s.config.Endpoints {
 		wg.Add(1)
@@ -119,6 +159,45 @@ func (s *Server) Run() (err error) {
 	s.logger.Info("running")
 	wg.Wait()
 	return
+}
+
+func (s *Server) calculateDownstreamBandwidth() {
+	ticker := time.NewTicker(ServerCalculateBandwidthInterval)
+	defer ticker.Stop()
+
+	// detect bandwidth cap first, serially
+	s.ds.Range(func(_ uuid.UUID, ds *downstream) bool {
+		name := ds.endpointName[0] // MUST EXIST
+		se, ok := s.se.Load(name)
+		if !ok {
+			// SHOULD NEVER HAPPEN
+			s.logger.Error("calculate downstream bandwidth not find available endpoint", "endpoint", name)
+			return true
+		}
+
+		s.handleUpstreamTcpConn(se, ServerRequestOperationTestBandwidth, nil)
+		return true
+	})
+
+	for t := range ticker.C {
+		s.logger.Debug("update downstream bandwidth")
+
+		s.ds.Range(func(k uuid.UUID, ds *downstream) bool {
+			var bandwidth int64
+
+			ds.mu.RLock()
+			for _, dc := range ds.dc {
+				// TODO: now only calculate server -> client (upstream -> downstream)
+				b := dc.proxier.BytesB2A()
+				bandwidth += b
+			}
+			ds.mu.RUnlock()
+
+			ds.bandwidth = int64(float64(bandwidth) / t.Sub(ds.bandwidthLastUpdate).Seconds())
+			ds.bandwidthLastUpdate = t
+			return true
+		})
+	}
 }
 
 func (s *Server) handleRegisterDownstreamEndpoint(conn net.Conn) {
@@ -142,76 +221,140 @@ func (s *Server) handleRegisterDownstreamEndpoint(conn net.Conn) {
 		s.logger.Error("unable to handle register downstream endpoint", "error", err)
 		return
 	}
-	dc := &downstreamConn{
-		Session:      session,
-		Conn:         conn,
-		EndpointName: rd.Endpoints,
-		ConnNum:      0,
-	}
-	s.logger.Debug("registered downstream", "addr", dc.Conn.RemoteAddr(), "endpoints", rd.Endpoints)
 
-	s.mu.Lock()
-	s.dc = append(s.dc, dc)
-	s.mu.Unlock()
+	ds, ok := s.ds.Load(rd.UUID)
+	if !ok {
+		ds = &downstream{
+			uuid:                rd.UUID,
+			endpointName:        rd.Endpoints,
+			dc:                  make([]*downstreamConn, 0, 8),
+			bandwidthLastUpdate: time.Now(),
+		}
+		s.ds.Store(rd.UUID, ds)
+	}
+
+	dc := &downstreamConn{
+		ds:      ds,
+		Session: session,
+		Conn:    conn,
+		load:    xsync.NewCounter(),
+	}
+	ds.mu.Lock()
+	ds.dc = append(ds.dc, dc)
+	ds.mu.Unlock()
+
+	s.logger.Debug("registered downstream", "addr", dc.Conn.RemoteAddr(), "endpoints", rd.Endpoints)
 	return
 }
 
-func (s *Server) findAvailableDownstream(name string) (adc *downstreamConn) {
-	var dsc int32 = math.MaxInt32
+func (s *Server) findDownstreamConn(name string) (adc *downstreamConn, err error) {
+	switch strings.ToUpper(s.config.Server.DownstreamSelectionStrategy) {
+	case DownstreamSelectionStrategyConn.String():
+		adc, err = s.findDownstreamConnByConnNum(name)
+	case DownstreamSelectionStrategyBandwidth.String():
+		adc, err = s.findDownstreamConnByBandwidth(name)
+	default:
+		err = ErrUnknownDownstreamSelectionStrategy
+	}
+	return
+}
 
-	s.mu.Lock()
-	for _, ds := range s.dc {
-		for _, en := range ds.EndpointName {
-			if en == name && atomic.LoadInt32(&ds.ConnNum) < dsc {
-				adc = ds
-				dsc = adc.ConnNum
-				break
+func (s *Server) findDownstreamConnByBandwidth(name string) (adc *downstreamConn, err error) {
+	var (
+		maxbw int64 = -math.MaxInt64
+		minbw int64 = math.MaxInt64
+		ads   *downstream
+	)
+
+	// find available downstream
+	s.ds.Range(func(_ uuid.UUID, ds *downstream) bool {
+		if lo.IndexOf(ds.endpointName, name) == -1 {
+			return true
+		}
+
+		if ds.bandwidthCap > 0 {
+			// find largest available one
+			left := ds.bandwidthCap - ds.bandwidth
+			if left > maxbw {
+				maxbw = left
+				ads = ds
+			}
+		} else {
+			// find less used one
+			if ds.bandwidth < minbw {
+				minbw = ds.bandwidth
+				ads = ds
 			}
 		}
+		return true
+	})
+	if ads == nil {
+		err = ErrNoAvailableDownstream
+		return
 	}
-	s.mu.Unlock()
+
+	// find available downstream conn
+	var dsc int64 = math.MaxInt64
+	ads.mu.RLock()
+	for _, dc := range ads.dc {
+		if dc.load.Value() < dsc {
+			adc = dc
+			dsc = dc.load.Value()
+		}
+	}
+	ads.mu.RUnlock()
+	if adc == nil {
+		err = ErrNoAvailableDownstream
+		return
+	}
+	return
+}
+
+func (s *Server) findDownstreamConnByConnNum(name string) (adc *downstreamConn, err error) {
+	var dsc int64 = math.MaxInt64
+
+	s.ds.Range(func(_ uuid.UUID, ds *downstream) bool {
+		if lo.IndexOf(ds.endpointName, name) == -1 {
+			return true
+		}
+
+		ds.mu.RLock()
+		for _, dc := range ds.dc {
+			if dc.load.Value() < dsc {
+				adc = dc
+				dsc = dc.load.Value()
+			}
+		}
+		ds.mu.RUnlock()
+		return true
+	})
+	if adc == nil {
+		err = ErrNoAvailableDownstream
+		return
+	}
 	return
 }
 
 func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerRequestOperation, conn net.Conn) {
 	defer func(conn net.Conn) {
-		err := conn.Close()
-		if err != nil {
-			s.logger.Debug("close conn error", "error", err)
-			return
+		if conn != nil {
+			err := conn.Close()
+			if err != nil {
+				s.logger.Debug("close conn error", "error", err)
+				return
+			}
 		}
 	}(conn)
 
-	var (
-		adc *downstreamConn
-		dsc int32 = math.MaxInt32
-	)
-
-	s.mu.Lock()
-	for _, ds := range s.dc {
-		for _, en := range ds.EndpointName {
-			if en == endpoint.config.Name && atomic.LoadInt32(&ds.ConnNum) < dsc {
-				adc = ds
-				dsc = adc.ConnNum
-				break
-			}
-		}
-	}
-	s.mu.Unlock()
-
-	if adc == nil {
-		s.logger.Error("unable to find available downstream")
+	dc, err := s.findDownstreamConn(endpoint.config.Name)
+	if err != nil {
+		s.logger.Error("unable to find available downstream", "error", err)
 		return
 	}
-	atomic.AddInt32(&adc.ConnNum, 1)
-	defer func() {
-		atomic.AddInt32(&adc.ConnNum, -1)
-	}()
+	dc.load.Inc()
+	defer dc.load.Dec()
 
-	s.logger.Debug("handle request", "endpoint", endpoint.config.Name, "downstream_addr",
-		adc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
-
-	ss, err := adc.Session.OpenStream()
+	ss, err := dc.Session.OpenStream()
 	if err != nil {
 		s.logger.Error("unable to setup downstream stream", "error", err)
 		return
@@ -237,16 +380,27 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerReques
 
 	switch op {
 	case ServerRequestOperationConnect:
-		err = proxyConn(conn, ss)
+		s.logger.Debug("handle request", "endpoint", endpoint.config.Name, "downstream_addr",
+			dc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
+
+		dc.proxier = NewProxier(conn, ss) // MUST: conn is B, ss is A
+		err = dc.proxier.Proxy()
 		if err != nil {
 			s.logger.Error("proxy conn error", "error", err)
 		}
+
+		s.logger.Debug("handle request done", "endpoint", endpoint.config.Name, "downstream_addr",
+			dc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
 	case ServerRequestOperationTestBandwidth:
-		s.testBandwidth(endpoint, ss)
+		s.logger.Debug("bandwidth cap test start", "endpoint", endpoint.config.Name, "downstream_addr",
+			dc.Session.RemoteAddr(), "protocol", endpoint.config.Protocol)
+
+		s.testBandwidth(dc.ds, ss)
+
+		s.logger.Debug("bandwidth cap test end", "endpoint", endpoint.config.Name, "downstream_addr",
+			dc.Session.RemoteAddr(), "protocol", endpoint.config.Protocol)
 	}
 
-	s.logger.Debug("handle request done", "endpoint", endpoint.config.Name, "downstream_addr",
-		adc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
 	return
 }
 
@@ -289,7 +443,8 @@ func (s *Server) handleEndpoint(endpoint *serverEndpoint) {
 	}
 }
 
-func (s *Server) testBandwidth(endpoint *serverEndpoint, conn net.Conn) {
+// TODO: now only test server to client bandwidth
+func (s *Server) testBandwidth(ds *downstream, conn net.Conn) {
 	var (
 		buf       = make([]byte, 4096)
 		startTime = time.Now()
@@ -298,7 +453,7 @@ func (s *Server) testBandwidth(endpoint *serverEndpoint, conn net.Conn) {
 	)
 	for {
 		costTime := time.Now().Sub(startTime)
-		if costTime > time.Second*5 {
+		if costTime > ServerCalculateBandwidthCapDuration {
 			break
 		}
 
@@ -311,6 +466,6 @@ func (s *Server) testBandwidth(endpoint *serverEndpoint, conn net.Conn) {
 			written += uint64(n)
 		}
 	}
-	endpoint.bandwidth = uint64(float64(written) / costTime.Seconds())
+	ds.bandwidthCap = int64(float64(written) / costTime.Seconds())
 	return
 }

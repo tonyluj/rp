@@ -4,12 +4,13 @@ log_level = "info"
 [server]
 protocol = "tcp"
 listen_downstream_addr = ":8022"
+downstream_selection_strategy = "conn" # conn or bandwidth, choose less
 
 [client]
 conn_pool_size = 8
 
 [[client.upstream]]
-name = "sh-tonylu-cloud"
+name = "sh-tonylu-cloud" # unique name for client-side
 protocol = "tcp"
 addr = "example.com:8022"
 max_retries = 30 # -1 for infinity

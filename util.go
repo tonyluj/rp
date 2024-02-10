@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -16,16 +17,39 @@ func init() {
 	}}
 }
 
-func proxyConn(dst, src io.ReadWriteCloser) (err error) {
+var errInvalidWrite = errors.New("invalid write result")
+
+type Proxier struct {
+	connA, connB       io.ReadWriter
+	bytesA2B, bytesB2A int64 // write to dst
+}
+
+func NewProxier(connA, connB io.ReadWriter) (p *Proxier) {
+	p = &Proxier{
+		connA: connA,
+		connB: connB,
+	}
+	return
+}
+
+func (p *Proxier) BytesA2B() int64 {
+	return p.bytesA2B
+}
+
+func (p *Proxier) BytesB2A() int64 {
+	return p.bytesB2A
+}
+
+func (p *Proxier) Proxy() (err error) {
 	go func() {
-		_, err = copyBuffer(src, dst)
+		err = p.copyBuffer(p.connA, p.connB, &p.bytesB2A)
 		if err != nil {
 			err = fmt.Errorf("proxy conn error: %w", err)
 			return
 		}
 	}()
 
-	_, err = copyBuffer(dst, src)
+	err = p.copyBuffer(p.connB, p.connA, &p.bytesA2B)
 	if err != nil {
 		err = fmt.Errorf("proxy conn error: %w", err)
 		return
@@ -33,9 +57,39 @@ func proxyConn(dst, src io.ReadWriteCloser) (err error) {
 	return
 }
 
-func copyBuffer(dst io.WriteCloser, src io.ReadCloser) (written int64, err error) {
+// copied from io.copyBuffer, add written pointer
+func (p *Proxier) copyBuffer(dst io.Writer, src io.Reader, written *int64) (err error) {
 	buf := proxyBufferPool.Get().([]byte)
 	defer proxyBufferPool.Put(buf)
 
-	return io.CopyBuffer(dst, src, buf)
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errInvalidWrite
+				}
+			}
+			if written != nil {
+				*written += int64(nw)
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return err
 }

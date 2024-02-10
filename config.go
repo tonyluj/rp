@@ -23,8 +23,9 @@ const (
 )
 
 var (
-	AvailableUpstreamProtocol = []string{"tcp"}
-	AvailableEndpointProtocol = []string{"tcp"}
+	AvailableUpstreamProtocol            = []string{"tcp"}
+	AvailableEndpointProtocol            = []string{"tcp"}
+	AvailableDownstreamSelectionStrategy = []string{"conn", "bandwidth"}
 )
 
 type Config struct {
@@ -36,8 +37,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Protocol             string `toml:"protocol"`
-	ListenDownstreamAddr string `toml:"listen_downstream_addr"`
+	Protocol                    string `toml:"protocol"`
+	ListenDownstreamAddr        string `toml:"listen_downstream_addr"`
+	DownstreamSelectionStrategy string `toml:"downstream_selection_strategy"`
 }
 
 type ClientUpstreamConfig struct {
@@ -243,6 +245,10 @@ func ParseConfig() (config Config, err error) {
 		}
 		if config.Server.ListenDownstreamAddr == "" {
 			err = errors.New("empty server listen addr")
+			return
+		}
+		if lo.IndexOf(AvailableDownstreamSelectionStrategy, strings.ToLower(config.Server.DownstreamSelectionStrategy)) == -1 {
+			err = ErrUnknownDownstreamSelectionStrategy
 			return
 		}
 	}
