@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -143,7 +144,24 @@ func (s *Server) handleRegisterDownstreamEndpoint(conn net.Conn) {
 	return
 }
 
-func (s *Server) handleUpstreamConn(endpoint *serverEndpoint, conn net.Conn) {
+func (s *Server) findAvailableDownstream(name string) (adc *downstreamConn) {
+	var dsc int32 = math.MaxInt32
+
+	s.mu.Lock()
+	for _, ds := range s.dc {
+		for _, en := range ds.EndpointName {
+			if en == name && atomic.LoadInt32(&ds.ConnNum) < dsc {
+				adc = ds
+				dsc = adc.ConnNum
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+	return
+}
+
+func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, conn net.Conn) {
 	var (
 		adc *downstreamConn
 		dsc int32 = math.MaxInt32
@@ -171,7 +189,7 @@ func (s *Server) handleUpstreamConn(endpoint *serverEndpoint, conn net.Conn) {
 	}()
 
 	s.logger.Debug("handle request", "endpoint", endpoint.config.Name, "downstream_addr",
-		adc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr())
+		adc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
 
 	ss, err := adc.Session.OpenStream()
 	if err != nil {
@@ -192,13 +210,11 @@ func (s *Server) handleUpstreamConn(endpoint *serverEndpoint, conn net.Conn) {
 	proxyConn(conn, ss)
 
 	s.logger.Debug("handle request done", "endpoint", endpoint.config.Name, "downstream_addr",
-		adc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr())
+		adc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
 	return
 }
 
-func (s *Server) handleEndpoint(endpoint *serverEndpoint) {
-	s.logger.Debug("handle endpoint", "name", endpoint.config.Name, "addr", endpoint.config.ListenAddr)
-
+func (s *Server) handleEndpointTcp(endpoint *serverEndpoint) {
 	l, err := net.Listen(endpoint.config.Protocol, endpoint.config.ListenAddr)
 	if err != nil {
 		s.logger.Error("server handle endpoint error", "error", err)
@@ -221,6 +237,18 @@ func (s *Server) handleEndpoint(endpoint *serverEndpoint) {
 			continue
 		}
 
-		go s.handleUpstreamConn(endpoint, conn)
+		go s.handleUpstreamTcpConn(endpoint, conn)
+	}
+}
+
+func (s *Server) handleEndpoint(endpoint *serverEndpoint) {
+	s.logger.Debug("handle endpoint", "name", endpoint.config.Name, "addr", endpoint.config.ListenAddr)
+
+	switch strings.ToLower(endpoint.config.Protocol) {
+	case "tcp":
+		s.handleEndpointTcp(endpoint)
+	default:
+		// THIS SHOULD NEVER HAPPEN
+		s.logger.Error("unknown protocol", "protocol", endpoint.config.Protocol)
 	}
 }

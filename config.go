@@ -23,6 +23,7 @@ const (
 )
 
 var (
+	AvailableUpstreamProtocol = []string{"tcp"}
 	AvailableEndpointProtocol = []string{"tcp"}
 )
 
@@ -204,7 +205,7 @@ func ParseConfig() (config Config, err error) {
 				err = errors.New("empty upstream addr")
 				return
 			}
-			if lo.IndexOf(AvailableEndpointProtocol, strings.ToLower(up.Protocol)) == -1 {
+			if lo.IndexOf(AvailableUpstreamProtocol, strings.ToLower(up.Protocol)) == -1 {
 				err = errors.New("no available upstream protocol")
 				return
 			}
@@ -236,7 +237,7 @@ func ParseConfig() (config Config, err error) {
 			err = errors.New("role is server, but no server config found")
 			return
 		}
-		if lo.IndexOf(AvailableEndpointProtocol, config.Server.Protocol) == -1 {
+		if lo.IndexOf(AvailableUpstreamProtocol, config.Server.Protocol) == -1 {
 			err = fmt.Errorf("unknown server protocol: %v", config.Server.Protocol)
 			return
 		}
