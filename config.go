@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -105,17 +104,7 @@ func parseLogLevel(logLevel string) (ll slog.Level) {
 	return
 }
 
-func ParseConfig() (config Config, err error) {
-	var (
-		configFile string
-		role       string
-		logLevel   string
-	)
-	flag.StringVar(&configFile, "c", "./rp.toml", "config file")
-	flag.StringVar(&role, "r", "", "run role, override config file")
-	flag.StringVar(&logLevel, "l", "", "log level, override config file")
-	flag.Parse()
-
+func ParseConfig(configFile, role, logLevel string) (config Config, err error) {
 	_, err = toml.DecodeFile(configFile, &config)
 	if err != nil {
 		err = fmt.Errorf("parse config error: %w", err)
