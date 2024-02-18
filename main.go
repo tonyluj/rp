@@ -4,7 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"strings"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 var (
@@ -35,6 +38,10 @@ func main() {
 	if err != nil {
 		defaultLogger.Error("run failed", "error", err)
 		return
+	}
+
+	if defaultLogger.Enabled(context.Background(), slog.LevelDebug) {
+		fmt.Print(spew.Sdump(config))
 	}
 
 	ctx := context.Background()

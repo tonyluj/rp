@@ -4,6 +4,7 @@ go 1.22
 
 require (
 	github.com/BurntSushi/toml v1.3.2
+	github.com/davecgh/go-spew v1.1.1
 	github.com/google/uuid v1.6.0
 	github.com/puzpuzpuz/xsync/v3 v3.0.2
 	github.com/samber/lo v1.39.0
