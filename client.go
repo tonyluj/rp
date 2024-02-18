@@ -82,61 +82,45 @@ func (c *Client) handleSetupConn(payload any) (err error) {
 		return
 	}
 
-	conn, err := c.setupUpstreamConn(event.upstream)
+	err = c.trySetupUpstreamConn(event.upstream)
 	if err != nil {
 		err = fmt.Errorf("unable to setup conn: %w", err)
 		return
 	}
-
-	event.upstream.mu.Lock()
-	event.upstream.uc = append(event.upstream.uc, conn)
-	event.upstream.mu.Unlock()
 	return
 }
 
 func (c *Client) initConn(up *Upstream) (conn net.Conn, err error) {
-	var retries = up.config.MaxRetries
-	for retries > 0 {
-		conn, err = net.Dial(up.config.Protocol, up.config.Addr)
+	conn, err = net.Dial(up.config.Protocol, up.config.Addr)
+	if err != nil {
+		err = fmt.Errorf("init conn error: %w", err)
+		return
+	}
+	return
+}
+
+func (c *Client) trySetupUpstreamConn(up *Upstream) (err error) {
+	for tries := 0; tries < up.config.MaxRetries+1; tries++ {
+		err = c.setupUpstreamConn(up)
 		if err != nil {
-			retries--
-			time.Sleep(time.Duration(up.config.RetryInterval) * time.Second)
+			time.Sleep(time.Second * time.Duration(up.config.RetryInterval))
 			continue
 		}
-
-		c.logger.Debug("dial upstream done", "addr", conn.RemoteAddr())
+		break
+	}
+	if err != nil {
+		err = fmt.Errorf("try setup upstream conn error: %w", err)
 		return
 	}
 
-	c.logger.Debug("dial upstream failed", "error", err)
 	return
 }
 
-func (c *Client) initUpstreamConnPool() (err error) {
-	for _, up := range c.us {
-		up.uc = make([]*UpstreamConn, 0, c.config.Client.ConnPoolSize)
-
-		for range c.config.Client.ConnPoolSize {
-			uc, err := c.setupUpstreamConn(up)
-			if err != nil {
-				err = fmt.Errorf("unable to setup upstream: %w", err)
-				continue
-			}
-
-			up.mu.Lock()
-			up.uc = append(up.uc, uc)
-			up.mu.Unlock()
-		}
-	}
-	return
-}
-
-func (c *Client) setupUpstreamConn(up *Upstream) (uc *UpstreamConn, err error) {
-	uc = new(UpstreamConn)
+func (c *Client) setupUpstreamConn(up *Upstream) (err error) {
+	uc := new(UpstreamConn)
 	uc.Conn, err = c.initConn(up)
 	if err != nil {
-		err = fmt.Errorf("init conn pool error: %w", err)
-		return
+		goto out
 	}
 
 	uc.Session, err = smux.Server(uc.Conn, &smux.Config{
@@ -149,32 +133,47 @@ func (c *Client) setupUpstreamConn(up *Upstream) (uc *UpstreamConn, err error) {
 		MaxStreamBuffer:   512 * 1024,
 	})
 	if err != nil {
-		err = fmt.Errorf("init conn pool error: %w", err)
-		return
+		goto cleanConn
 	}
 
+	err = c.registerUpstreamConnEndpoint(up, uc)
+	if err != nil {
+		goto cleanSession
+	}
+
+	up.mu.Lock()
+	up.uc = append(up.uc, uc)
+	up.mu.Unlock()
+	return
+
+cleanSession:
+	if er := uc.Session.Close(); er != nil {
+		c.logger.Debug("clean up conn session error", "error", er)
+		return err
+	}
+cleanConn:
+	if er := uc.Conn.Close(); er != nil {
+		c.logger.Debug("clean up conn error", "error", er)
+		return err
+	}
+out:
+	err = fmt.Errorf("setup upstream conn error: %w", err)
 	return
 }
 
-func (c *Client) registerEndpoint() (err error) {
-	for _, up := range c.us {
-		req := RegisterDownstream{
-			UUID:      c.uuid,
-			Endpoints: up.config.Endpoints,
-		}
-
-		up.mu.Lock()
-		for _, uc := range up.uc {
-			err = gob.NewEncoder(uc.Conn).Encode(req)
-			if err != nil {
-				err = fmt.Errorf("unable to register endpint: %w", err)
-				break
-			}
-
-			c.logger.Debug("register done", "addr", uc.Conn.RemoteAddr())
-		}
-		up.mu.Unlock()
+func (c *Client) registerUpstreamConnEndpoint(up *Upstream, uc *UpstreamConn) (err error) {
+	req := RegisterDownstream{
+		UUID:      c.uuid,
+		Endpoints: up.config.Endpoints,
 	}
+
+	err = gob.NewEncoder(uc.Conn).Encode(req)
+	if err != nil {
+		err = fmt.Errorf("unable to register endpint: %w", err)
+		return
+	}
+
+	c.logger.Debug("register done", "addr", uc.Conn.RemoteAddr())
 	return
 }
 
@@ -193,6 +192,7 @@ func (c *Client) initUpstream() {
 		up := &Upstream{
 			config: &cu,
 			es:     cu.Endpoints,
+			uc:     make([]*UpstreamConn, 0, c.config.Client.ConnPoolSize),
 		}
 		c.us[cu.Name] = up
 	}
@@ -254,16 +254,17 @@ func (c *Client) handleUpstreamStream(up *Upstream, ss *smux.Stream) {
 	return
 }
 
-func (c *Client) handleUpstreamConn(up *Upstream, uc *UpstreamConn) {
+func (c *Client) handleUpstreamConn(up *Upstream, uc *UpstreamConn) (err error) {
 	for {
 		stream, er := uc.Session.AcceptStream()
 		if er != nil {
-			if uc.Session.IsClosed() || er == io.EOF {
+			if uc.Session.IsClosed() || err == io.EOF {
 				c.logger.Debug("accept session closed, return")
+				err = errors.New("upstream session is closed")
 				return
 			}
-			c.logger.Error("unable to accept stream", "error", er)
 
+			c.logger.Error("unable to accept stream", "error", er)
 			time.Sleep(time.Millisecond * 10)
 			continue
 		}
@@ -292,32 +293,78 @@ func (c *Client) Close() {
 	return
 }
 
+func (c *Client) handleUpstream(up *Upstream) (err error) {
+	var (
+		failed int
+		er     error
+	)
+	for range c.config.Client.ConnPoolSize {
+		er = c.trySetupUpstreamConn(up)
+		if er != nil {
+			failed++
+			continue
+		}
+	}
+	if failed == c.config.Client.ConnPoolSize {
+		err = fmt.Errorf("handle whole upstream %s error: %w", up.config.Name, er)
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, uc := range up.uc {
+		wg.Add(1)
+
+		go func(up *Upstream, uc *UpstreamConn) {
+			wg.Done()
+
+			for {
+				er := c.handleUpstreamConn(up, uc)
+				if er == nil {
+					// SHOULD NEVER HAPPEN NOW
+					c.logger.Error("handle upstream conn exit without error")
+					break
+				}
+
+				// cleanup
+				er = uc.Session.Close()
+				if er != nil {
+					c.logger.Debug("clean up upstream session error", "error", er)
+				}
+				er = uc.Conn.Close()
+				if er != nil {
+					c.logger.Debug("clean up upstream conn error", "error", er)
+				}
+
+				er = c.trySetupUpstreamConn(up)
+				if er != nil {
+					c.logger.Error("setup upstream max retries reached, abort", "error", er)
+					break
+				}
+			}
+		}(up, uc)
+	}
+	wg.Wait()
+	return
+}
+
 func (c *Client) Run() (err error) {
 	c.initEndpoint()
 	c.initUpstream()
 	c.initEventHub()
-	err = c.initUpstreamConnPool()
-	if err != nil {
-		err = fmt.Errorf("run client error: %w", err)
-		return err
-	}
-	err = c.registerEndpoint()
-	if err != nil {
-		err = fmt.Errorf("run client error: %w", err)
-		return err
-	}
 
 	var wg sync.WaitGroup
 	for _, up := range c.us {
-		for _, uc := range up.uc {
-			wg.Add(1)
+		wg.Add(1)
 
-			go func(uc *UpstreamConn) {
-				defer wg.Done()
+		go func(up *Upstream) {
+			defer wg.Done()
 
-				c.handleUpstreamConn(up, uc)
-			}(uc)
-		}
+			er := c.handleUpstream(up)
+			if er != nil {
+				c.logger.Error("upstream handle error", "upstream", up.config.Name, "error", er)
+				return
+			}
+		}(up)
 	}
 	c.logger.Info("running")
 	wg.Wait()

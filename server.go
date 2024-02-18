@@ -411,21 +411,22 @@ func (s *Server) recoverDownstream(ds *downstream) (err error) {
 	}
 
 	var (
-		retries int
-		todo    = failed
+		tries int
+		todo  = failed
 	)
 	for todo > 0 {
-		retries++
+		tries++
+		if tries > failed*5 {
+			err = errors.New("unable to recovery downstream, too many retries")
+			break
+		}
+
 		er := s.recoverDownstreamConn(ds)
 		if er != nil {
 			s.logger.Error("unable to recover downstream conn", "error", err)
 			continue
 		}
 		todo--
-	}
-	if retries > failed*3 {
-		err = errors.New("unable to recovery downstream, too many retries")
-		return
 	}
 
 	return

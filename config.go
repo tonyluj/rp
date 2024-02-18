@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 
@@ -203,6 +204,11 @@ func ParseConfig(configFile, role, logLevel string) (config Config, err error) {
 			// correct retries
 			if up.MaxRetries == 0 {
 				up.MaxRetries = ClientDialUpstreamMaxRetries
+			} else if up.MaxRetries == -1 {
+				up.MaxRetries = math.MaxInt
+			} else if up.MaxRetries < -1 {
+				err = errors.New("unavailable max retries")
+				return
 			}
 			if up.RetryInterval == 0 {
 				up.RetryInterval = ClientDialUpstreamRetryInterval
