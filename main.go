@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 )
 
@@ -11,10 +12,11 @@ func main() {
 		return
 	}
 
+	ctx := context.Background()
 	switch strings.ToUpper(config.Role) {
 	case "SERVER":
 		s := NewServer(config, defaultLogger)
-		err = s.Run()
+		err = s.Run(ctx)
 	case "CLIENT":
 		c := NewClient(config, defaultLogger)
 		err = c.Run()

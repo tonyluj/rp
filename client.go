@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/xtaci/smux"
 )
+
+const (
+	EventTypeClientSetupConn EventType = "EVENT_TYPE_CLIENT_SETUP_CONN"
+)
+
+type eventClientSetupConn struct {
+	upstream *Upstream
+}
 
 type RegisterDownstream struct {
 	UUID      [16]byte // for unique ID for server side
@@ -37,6 +46,7 @@ type Client struct {
 	logger *slog.Logger
 	ce     map[string]*clientEndpoint
 	uuid   uuid.UUID
+	eh     *EventHub
 }
 
 type clientEndpoint struct {
@@ -56,13 +66,36 @@ func NewClient(config Config, logger *slog.Logger) (client *Client) {
 		ce:     make(map[string]*clientEndpoint, 16),
 		logger: logger,
 		uuid:   id,
+		eh:     NewEventHub(logger),
 	}
+	return
+}
+
+func (c *Client) initEventHub() {
+	c.eh.RegisterHandler(EventTypeServerSetupConn, c.handleSetupConn, false)
+}
+
+func (c *Client) handleSetupConn(payload any) (err error) {
+	event, ok := payload.(*eventClientSetupConn)
+	if !ok {
+		err = errors.New("unknown event type")
+		return
+	}
+
+	conn, err := c.setupUpstreamConn(event.upstream)
+	if err != nil {
+		err = fmt.Errorf("unable to setup conn: %w", err)
+		return
+	}
+
+	event.upstream.mu.Lock()
+	event.upstream.uc = append(event.upstream.uc, conn)
+	event.upstream.mu.Unlock()
 	return
 }
 
 func (c *Client) initConn(up *Upstream) (conn net.Conn, err error) {
 	var retries = up.config.MaxRetries
-
 	for retries > 0 {
 		conn, err = net.Dial(up.config.Protocol, up.config.Addr)
 		if err != nil {
@@ -84,24 +117,10 @@ func (c *Client) initUpstreamConnPool() (err error) {
 		up.uc = make([]*UpstreamConn, 0, c.config.Client.ConnPoolSize)
 
 		for range c.config.Client.ConnPoolSize {
-			uc := new(UpstreamConn)
-			uc.Conn, err = c.initConn(up)
+			uc, err := c.setupUpstreamConn(up)
 			if err != nil {
-				err = fmt.Errorf("init conn pool error: %w", err)
-				return
-			}
-			uc.Session, err = smux.Server(uc.Conn, &smux.Config{
-				Version:           2,
-				KeepAliveDisabled: false,
-				KeepAliveInterval: time.Second * 15,
-				KeepAliveTimeout:  time.Second * 30,
-				MaxFrameSize:      32 * 1024,
-				MaxReceiveBuffer:  512 * 1024,
-				MaxStreamBuffer:   512 * 1024,
-			})
-			if err != nil {
-				err = fmt.Errorf("init conn pool error: %w", err)
-				return
+				err = fmt.Errorf("unable to setup upstream: %w", err)
+				continue
 			}
 
 			up.mu.Lock()
@@ -109,6 +128,31 @@ func (c *Client) initUpstreamConnPool() (err error) {
 			up.mu.Unlock()
 		}
 	}
+	return
+}
+
+func (c *Client) setupUpstreamConn(up *Upstream) (uc *UpstreamConn, err error) {
+	uc = new(UpstreamConn)
+	uc.Conn, err = c.initConn(up)
+	if err != nil {
+		err = fmt.Errorf("init conn pool error: %w", err)
+		return
+	}
+
+	uc.Session, err = smux.Server(uc.Conn, &smux.Config{
+		Version:           2,
+		KeepAliveDisabled: false,
+		KeepAliveInterval: time.Second * 15,
+		KeepAliveTimeout:  time.Second * 30,
+		MaxFrameSize:      32 * 1024,
+		MaxReceiveBuffer:  512 * 1024,
+		MaxStreamBuffer:   512 * 1024,
+	})
+	if err != nil {
+		err = fmt.Errorf("init conn pool error: %w", err)
+		return
+	}
+
 	return
 }
 
@@ -155,7 +199,7 @@ func (c *Client) initUpstream() {
 	return
 }
 
-func (c *Client) handleUpstreamStream(uc *UpstreamConn, ss *smux.Stream) {
+func (c *Client) handleUpstreamStream(up *Upstream, ss *smux.Stream) {
 	defer func() {
 		err := ss.Close()
 		if err != nil {
@@ -200,6 +244,8 @@ func (c *Client) handleUpstreamStream(uc *UpstreamConn, ss *smux.Stream) {
 		}
 	case ServerRequestOperationTestBandwidth:
 		c.handleTestBandwidth(enp, ss)
+	case ServerRequestOperationSetupConn:
+		c.eh.Emit(EventTypeClientSetupConn, &eventClientSetupConn{upstream: up})
 	default:
 		c.logger.Error("unknown server request operation", "error", ErrUnknownServerRequestOperation, "operation", req.Op)
 	}
@@ -208,7 +254,7 @@ func (c *Client) handleUpstreamStream(uc *UpstreamConn, ss *smux.Stream) {
 	return
 }
 
-func (c *Client) handleUpstreamConn(uc *UpstreamConn) {
+func (c *Client) handleUpstreamConn(up *Upstream, uc *UpstreamConn) {
 	for {
 		stream, er := uc.Session.AcceptStream()
 		if er != nil {
@@ -222,7 +268,7 @@ func (c *Client) handleUpstreamConn(uc *UpstreamConn) {
 			continue
 		}
 
-		go c.handleUpstreamStream(uc, stream)
+		go c.handleUpstreamStream(up, stream)
 	}
 }
 
@@ -249,6 +295,7 @@ func (c *Client) Close() {
 func (c *Client) Run() (err error) {
 	c.initEndpoint()
 	c.initUpstream()
+	c.initEventHub()
 	err = c.initUpstreamConnPool()
 	if err != nil {
 		err = fmt.Errorf("run client error: %w", err)
@@ -268,7 +315,7 @@ func (c *Client) Run() (err error) {
 			go func(uc *UpstreamConn) {
 				defer wg.Done()
 
-				c.handleUpstreamConn(uc)
+				c.handleUpstreamConn(up, uc)
 			}(uc)
 		}
 	}

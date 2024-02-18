@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -17,6 +18,29 @@ import (
 	"github.com/xtaci/smux"
 )
 
+type DownstreamState uint8
+
+func (ds DownstreamState) IsOk() (ok bool) {
+	if ds == DownstreamStateOk {
+		ok = true
+		return
+	}
+	return
+}
+
+const (
+	DownstreamStateOk            DownstreamState = 1 // all connections work fine
+	DownstreamStatePartialBroken DownstreamState = 2 // only partial connections work fine
+	DownstreamStateBroken        DownstreamState = 3 // all connections are broken
+)
+
+type DownstreamConnState uint8
+
+const (
+	DownstreamConnStateReady  DownstreamConnState = 1 // ready to use
+	DownstreamConnStateFailed DownstreamConnState = 2 // to be removed later
+)
+
 const (
 	ServerCalculateBandwidthInterval    = time.Second * 30
 	ServerCalculateBandwidthCapDuration = time.Second * 3
@@ -27,6 +51,7 @@ type ServerRequestOperation uint8
 const (
 	ServerRequestOperationConnect       ServerRequestOperation = 0
 	ServerRequestOperationTestBandwidth ServerRequestOperation = 1
+	ServerRequestOperationSetupConn     ServerRequestOperation = 2
 )
 
 var ErrUnknownServerRequestOperation = errors.New("unknown server request operation")
@@ -37,6 +62,14 @@ const (
 	DownstreamSelectionStrategyConn      DownstreamSelectionStrategy = 0 // select less connections number
 	DownstreamSelectionStrategyBandwidth DownstreamSelectionStrategy = 1 // select smaller current bandwidth
 )
+
+const (
+	EventTypeServerSetupConn EventType = "EVENT_TYPE_SERVER_SETUP_CONN"
+)
+
+type eventServerSetupConn struct {
+	ds *downstream
+}
 
 func (d DownstreamSelectionStrategy) String() string {
 	switch d {
@@ -66,10 +99,12 @@ type Server struct {
 	listener net.Listener
 	logger   *slog.Logger
 	se       *xsync.MapOf[string, *serverEndpoint] // serverEndpoint
+	eh       *EventHub
 }
 
 type downstream struct {
 	mu           sync.RWMutex
+	state        DownstreamState
 	uuid         uuid.UUID
 	endpointName []string // registered endpoint name
 	dc           []*downstreamConn
@@ -79,12 +114,80 @@ type downstream struct {
 	bandwidthLastUpdate time.Time // last update timestamp
 }
 
+func (ds *downstream) State() (state DownstreamState) {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+
+	state = ds.state
+	return
+}
+
+func (ds *downstream) checkAndUpdateState() (readyConn, failedConn int) {
+	for _, dc := range ds.dc {
+		switch dc.state {
+		case DownstreamConnStateReady:
+			readyConn++
+		case DownstreamConnStateFailed:
+			failedConn++
+		}
+	}
+	if readyConn == len(ds.dc) {
+		ds.state = DownstreamStateOk
+	} else if failedConn == len(ds.dc) {
+		ds.state = DownstreamStateBroken
+	} else if failedConn < len(ds.dc) {
+		ds.state = DownstreamStatePartialBroken
+	}
+	return
+}
+
+func (ds *downstream) CheckAndUpdateState() (state DownstreamState) {
+	ds.mu.Lock()
+	defer ds.mu.Lock()
+
+	ds.checkAndUpdateState()
+	state = ds.state
+	return
+}
+
+func (ds *downstream) UpdateState(state DownstreamState) {
+	ds.mu.Lock()
+	defer ds.mu.Lock()
+
+	if state == ds.state {
+		return
+	}
+
+	ds.state = state
+}
+
 type downstreamConn struct {
+	mu      sync.RWMutex
+	state   DownstreamConnState
 	ds      *downstream
-	Session *smux.Session
-	Conn    net.Conn
+	session *smux.Session
+	conn    net.Conn
 	load    *xsync.Counter
 	proxier *Proxier
+}
+
+func (dc *downstreamConn) State() (state DownstreamConnState) {
+	dc.mu.RLock()
+	defer dc.mu.RUnlock()
+
+	state = dc.state
+	return
+}
+
+func (dc *downstreamConn) UpdateState(state DownstreamConnState) {
+	dc.mu.Lock()
+	defer dc.mu.Lock()
+
+	if state == dc.state {
+		return
+	}
+
+	dc.state = state
 }
 
 type serverEndpoint struct {
@@ -97,6 +200,7 @@ func NewServer(config Config, logger *slog.Logger) (server *Server) {
 		ds:     xsync.NewMapOf[uuid.UUID, *downstream](),
 		logger: logger,
 		se:     xsync.NewMapOf[string, *serverEndpoint](),
+		eh:     NewEventHub(logger),
 	}
 	return
 }
@@ -118,6 +222,10 @@ func (s *Server) initDownstreamListener() (err error) {
 	return
 }
 
+func (s *Server) initEventHub() {
+	s.eh.RegisterHandler(EventTypeServerSetupConn, s.downstreamSetupConnHandler, false)
+}
+
 func (s *Server) doDownstreamListener() {
 	for {
 		conn, err := s.listener.Accept()
@@ -132,13 +240,16 @@ func (s *Server) doDownstreamListener() {
 	}
 }
 
-func (s *Server) Run() (err error) {
+func (s *Server) Run(ctx context.Context) (err error) {
 	err = s.initDownstreamListener()
 	if err != nil {
 		err = fmt.Errorf("run server error: %w", err)
 		return
 	}
+	s.initEventHub()
+	go s.eh.Run(ctx)
 	go s.doDownstreamListener()
+	go s.downstreamWatchdog()
 
 	if s.config.Server.DownstreamSelectionStrategy == DownstreamSelectionStrategyBandwidth.String() {
 		go s.calculateDownstreamBandwidth()
@@ -225,6 +336,7 @@ func (s *Server) handleRegisterDownstreamEndpoint(conn net.Conn) {
 	ds, ok := s.ds.Load(rd.UUID)
 	if !ok {
 		ds = &downstream{
+			state:               DownstreamStateOk,
 			uuid:                rd.UUID,
 			endpointName:        rd.Endpoints,
 			dc:                  make([]*downstreamConn, 0, 8),
@@ -234,16 +346,120 @@ func (s *Server) handleRegisterDownstreamEndpoint(conn net.Conn) {
 	}
 
 	dc := &downstreamConn{
+		state:   DownstreamConnStateReady,
 		ds:      ds,
-		Session: session,
-		Conn:    conn,
+		session: session,
+		conn:    conn,
 		load:    xsync.NewCounter(),
 	}
 	ds.mu.Lock()
 	ds.dc = append(ds.dc, dc)
 	ds.mu.Unlock()
 
-	s.logger.Debug("registered downstream", "addr", dc.Conn.RemoteAddr(), "endpoints", rd.Endpoints)
+	// update downstream state when new connection added
+	ds.CheckAndUpdateState()
+
+	s.logger.Debug("registered downstream", "addr", dc.conn.RemoteAddr(), "endpoints", rd.Endpoints)
+	return
+}
+
+func (s *Server) downstreamSetupConnHandler(data any) (err error) {
+	event, ok := data.(*eventServerSetupConn)
+	if !ok {
+		err = errors.New("unknown event type")
+		return
+	}
+	if event.ds.state == DownstreamStateBroken {
+		// downstream is total broken, unable to recover
+		s.logger.Warn("downstream is all broken, unable to recover", "downstream", event.ds.uuid.String())
+		return
+	}
+
+	err = s.recoverDownstream(event.ds)
+	if err != nil {
+		s.logger.Error("recovery downstream failed", "downstream", event.ds.uuid.String())
+		return
+	}
+
+	return
+}
+
+func (s *Server) downstreamWatchdog() {
+	ticker := time.NewTicker(time.Second * 30)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.ds.Range(func(_ uuid.UUID, ds *downstream) bool {
+			if dsState := ds.CheckAndUpdateState(); !dsState.IsOk() {
+				s.logger.Debug("downstream watchdog detect failed", "downstream", ds.uuid.String())
+				s.eh.Emit(EventTypeServerSetupConn, &eventServerSetupConn{ds: ds})
+			}
+
+			return true
+		})
+	}
+}
+
+func (s *Server) recoverDownstream(ds *downstream) (err error) {
+	ds.mu.Lock()
+	defer ds.mu.Lock()
+
+	_, failed := ds.checkAndUpdateState()
+	if ds.state == DownstreamStateOk {
+		s.logger.Debug("downstream is ok, no need to recovery", "downstream", ds.uuid.String())
+		return
+	}
+
+	var (
+		retries int
+		todo    = failed
+	)
+	for todo > 0 {
+		retries++
+		er := s.recoverDownstreamConn(ds)
+		if er != nil {
+			s.logger.Error("unable to recover downstream conn", "error", err)
+			continue
+		}
+		todo--
+	}
+	if retries > failed*3 {
+		err = errors.New("unable to recovery downstream, too many retries")
+		return
+	}
+
+	return
+}
+
+func (s *Server) recoverDownstreamConn(ds *downstream) (err error) {
+	for _, dc := range ds.dc {
+		dc.load.Inc()
+
+		ss, err := dc.session.OpenStream()
+		if err != nil {
+			dc.load.Dec()
+			s.logger.Error("recover downstream stream error", "error", err)
+			continue
+		}
+
+		err = s.sendRequest("", ServerRequestOperationSetupConn, ss)
+		if err != nil {
+			if er := ss.Close(); er != nil {
+				s.logger.Error("recover downstream stream close error", "error", err)
+			}
+
+			dc.load.Dec()
+			s.logger.Error("recover downstream stream error", "error", err)
+			continue
+		}
+
+		if er := ss.Close(); er != nil {
+			s.logger.Error("recover downstream stream close error", "error", err)
+		}
+		dc.load.Dec()
+		break
+	}
+
 	return
 }
 
@@ -268,7 +484,7 @@ func (s *Server) findDownstreamConnByBandwidth(name string) (adc *downstreamConn
 
 	// find available downstream
 	s.ds.Range(func(_ uuid.UUID, ds *downstream) bool {
-		if lo.IndexOf(ds.endpointName, name) == -1 {
+		if lo.IndexOf(ds.endpointName, name) == -1 || ds.State() == DownstreamStateBroken {
 			return true
 		}
 
@@ -314,7 +530,7 @@ func (s *Server) findDownstreamConnByConnNum(name string) (adc *downstreamConn, 
 	var dsc int64 = math.MaxInt64
 
 	s.ds.Range(func(_ uuid.UUID, ds *downstream) bool {
-		if lo.IndexOf(ds.endpointName, name) == -1 {
+		if lo.IndexOf(ds.endpointName, name) == -1 || ds.State() == DownstreamStateBroken {
 			return true
 		}
 
@@ -335,6 +551,43 @@ func (s *Server) findDownstreamConnByConnNum(name string) (adc *downstreamConn, 
 	return
 }
 
+func (s *Server) setupStream(name string) (dc *downstreamConn, ss *smux.Stream, err error) {
+	dc, err = s.findDownstreamConn(name)
+	if err != nil {
+		err = fmt.Errorf("unable to find available downstream connection: %w", err)
+		return
+	}
+	dc.load.Inc()
+
+	ss, err = dc.session.OpenStream()
+	if err != nil {
+		dc.load.Dec()
+		// downstream conn is broken, update state
+		dc.UpdateState(DownstreamConnStateFailed)
+		if dsState := dc.ds.CheckAndUpdateState(); !dsState.IsOk() {
+			s.logger.Debug("downstream setup detect failed", "downstream", dc.ds.uuid.String())
+			s.eh.Emit(EventTypeServerSetupConn, &eventServerSetupConn{ds: dc.ds})
+		}
+
+		err = fmt.Errorf("unable to setup available downstream stream: %w", err)
+		return
+	}
+	return
+}
+
+func (s *Server) sendRequest(name string, op ServerRequestOperation, ss *smux.Stream) (err error) {
+	req := ServerRequestEndpoint{
+		Name: name,
+		Op:   op,
+	}
+	err = gob.NewEncoder(ss).Encode(req)
+	if err != nil {
+		err = fmt.Errorf("unable to send request: %w", err)
+		return
+	}
+	return
+}
+
 func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerRequestOperation, conn net.Conn) {
 	defer func(conn net.Conn) {
 		if conn != nil {
@@ -346,33 +599,21 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerReques
 		}
 	}(conn)
 
-	dc, err := s.findDownstreamConn(endpoint.config.Name)
+	dc, ss, err := s.setupStream(endpoint.config.Name)
 	if err != nil {
-		s.logger.Error("unable to find available downstream", "error", err)
+		s.logger.Error("unable to setup downstream", "error", err)
 		return
 	}
-	dc.load.Inc()
-	defer dc.load.Dec()
-
-	ss, err := dc.Session.OpenStream()
-	if err != nil {
-		s.logger.Error("unable to setup downstream stream", "error", err)
-		return
-	}
-	defer func(ss *smux.Stream) {
+	defer func(dc *downstreamConn, ss *smux.Stream) {
+		dc.load.Dec()
 		err := ss.Close()
 		if err != nil {
 			s.logger.Debug("close stream error", "error", err)
 			return
 		}
-	}(ss)
+	}(dc, ss)
 
-	// handshake
-	req := ServerRequestEndpoint{
-		Name: endpoint.config.Name,
-		Op:   op,
-	}
-	err = gob.NewEncoder(ss).Encode(req)
+	err = s.sendRequest(endpoint.config.Name, op, ss)
 	if err != nil {
 		s.logger.Error("unable to downstream handshake req", "error", err)
 		return
@@ -380,8 +621,9 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerReques
 
 	switch op {
 	case ServerRequestOperationConnect:
+		t := time.Now()
 		s.logger.Debug("handle request", "endpoint", endpoint.config.Name, "downstream_addr",
-			dc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
+			dc.session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
 
 		dc.proxier = NewProxier(conn, ss) // MUST: conn is B, ss is A
 		err = dc.proxier.Proxy()
@@ -390,15 +632,16 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerReques
 		}
 
 		s.logger.Debug("handle request done", "endpoint", endpoint.config.Name, "downstream_addr",
-			dc.Session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol)
+			dc.session.RemoteAddr(), "remote_addr", conn.RemoteAddr(), "protocol", endpoint.config.Protocol,
+			"cost", time.Now().Sub(t))
 	case ServerRequestOperationTestBandwidth:
 		s.logger.Debug("bandwidth cap test start", "endpoint", endpoint.config.Name, "downstream_addr",
-			dc.Session.RemoteAddr(), "protocol", endpoint.config.Protocol)
+			dc.session.RemoteAddr(), "protocol", endpoint.config.Protocol)
 
 		s.testBandwidth(dc.ds, ss)
 
 		s.logger.Debug("bandwidth cap test end", "endpoint", endpoint.config.Name, "downstream_addr",
-			dc.Session.RemoteAddr(), "protocol", endpoint.config.Protocol)
+			dc.session.RemoteAddr(), "protocol", endpoint.config.Protocol)
 	}
 
 	return
