@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/samber/lo"
@@ -29,11 +28,12 @@ var (
 )
 
 type Config struct {
-	Role      string           `toml:"role"`
-	Endpoints []EndpointConfig `toml:"endpoint"`
-	LogLevel  string           `toml:"log_level"`
-	Server    *ServerConfig    `toml:"server"`
-	Client    *ClientConfig    `toml:"client"`
+	Role          string           `toml:"role"`
+	Endpoints     []EndpointConfig `toml:"endpoint"`
+	LogLevel      string           `toml:"log_level"`
+	HttpPprofAddr string           `toml:"http_pprof_addr"`
+	Server        *ServerConfig    `toml:"server"`
+	Client        *ClientConfig    `toml:"client"`
 }
 
 type ServerConfig struct {
@@ -78,7 +78,7 @@ func init() {
 }
 
 func parseEndpointMode(mode string) (m EndpointMode, err error) {
-	switch strings.ToUpper(mode) {
+	switch mode {
 	case "downstream":
 		m = EndpointModeDownstream
 	case "direct":
@@ -90,14 +90,14 @@ func parseEndpointMode(mode string) (m EndpointMode, err error) {
 }
 
 func parseLogLevel(logLevel string) (ll slog.Level) {
-	switch strings.ToUpper(logLevel) {
-	case "INFO":
+	switch logLevel {
+	case "info":
 		ll = slog.LevelInfo
-	case "DEBUG":
+	case "debug":
 		ll = slog.LevelDebug
-	case "WARN":
+	case "warn":
 		ll = slog.LevelWarn
-	case "ERROR":
+	case "error":
 		ll = slog.LevelError
 	default:
 		ll = slog.LevelInfo
@@ -115,7 +115,7 @@ func ParseConfig(configFile, role, logLevel string) (config Config, err error) {
 	if role != "" {
 		config.Role = role
 	}
-	switch strings.ToLower(config.Role) {
+	switch config.Role {
 	case RoleClient, RoleServer:
 	default:
 		err = errors.New("unknown role")
@@ -154,7 +154,7 @@ func ParseConfig(configFile, role, logLevel string) (config Config, err error) {
 			err = errors.New("empty endpoint addr")
 			return
 		}
-		if lo.IndexOf(AvailableEndpointProtocol, strings.ToLower(enp.Protocol)) == -1 {
+		if lo.IndexOf(AvailableEndpointProtocol, enp.Protocol) == -1 {
 			err = fmt.Errorf("unknown protocol: %v", enp.Protocol)
 			return
 		}
@@ -197,7 +197,7 @@ func ParseConfig(configFile, role, logLevel string) (config Config, err error) {
 				err = errors.New("empty upstream addr")
 				return
 			}
-			if lo.IndexOf(AvailableUpstreamProtocol, strings.ToLower(up.Protocol)) == -1 {
+			if lo.IndexOf(AvailableUpstreamProtocol, up.Protocol) == -1 {
 				err = errors.New("no available upstream protocol")
 				return
 			}
@@ -242,7 +242,7 @@ func ParseConfig(configFile, role, logLevel string) (config Config, err error) {
 			err = errors.New("empty server listen addr")
 			return
 		}
-		if lo.IndexOf(AvailableDownstreamSelectionStrategy, strings.ToLower(config.Server.DownstreamSelectionStrategy)) == -1 {
+		if lo.IndexOf(AvailableDownstreamSelectionStrategy, config.Server.DownstreamSelectionStrategy) == -1 {
 			err = ErrUnknownDownstreamSelectionStrategy
 			return
 		}

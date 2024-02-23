@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -15,6 +16,10 @@ import (
 )
 
 const (
+	ClientMaxAcceptConsecutiveErrors = 8
+)
+
+const (
 	EventTypeClientSetupConn EventType = "EVENT_TYPE_CLIENT_SETUP_CONN"
 )
 
@@ -22,7 +27,7 @@ type eventClientSetupConn struct {
 	upstream *Upstream
 }
 
-type RegisterDownstream struct {
+type RegisterDownstreamRequest struct {
 	UUID      [16]byte // for unique ID for server side
 	Endpoints []string // slice of endpoint name
 }
@@ -51,6 +56,7 @@ type Client struct {
 
 type clientEndpoint struct {
 	config *EndpointConfig
+	addr   net.Addr
 }
 
 func NewClient(config Config, logger *slog.Logger) (client *Client) {
@@ -162,7 +168,7 @@ out:
 }
 
 func (c *Client) registerUpstreamConnEndpoint(up *Upstream, uc *UpstreamConn) (err error) {
-	req := RegisterDownstream{
+	req := RegisterDownstreamRequest{
 		UUID:      c.uuid,
 		Endpoints: up.config.Endpoints,
 	}
@@ -177,10 +183,18 @@ func (c *Client) registerUpstreamConnEndpoint(up *Upstream, uc *UpstreamConn) (e
 	return
 }
 
-func (c *Client) initEndpoint() {
+func (c *Client) initEndpoint() (err error) {
 	for _, cfg := range c.config.Endpoints {
-		ep := &clientEndpoint{
-			config: &cfg,
+		ep := &clientEndpoint{config: &cfg}
+
+		switch cfg.Protocol {
+		case "tcp":
+			addr, er := net.ResolveTCPAddr(cfg.Protocol, cfg.TargetAddr)
+			if er != nil {
+				err = fmt.Errorf("init endpoint error: %w", er)
+				return
+			}
+			ep.addr = addr
 		}
 		c.ce[cfg.Name] = ep
 	}
@@ -221,11 +235,18 @@ func (c *Client) handleUpstreamStream(up *Upstream, ss *smux.Stream) {
 		return
 	}
 
-	c.logger.Debug("handle request", "endpoint", enp.config.Name)
-
 	switch req.Op {
 	case ServerRequestOperationConnect:
-		conn, err := net.Dial("tcp", enp.config.TargetAddr)
+		t := time.Now()
+		c.logger.Debug("handle request", "endpoint", enp.config.Name, "upstream_addr",
+			up.config.Addr, "local_addr", enp.config.TargetAddr, "protocol", enp.config.Protocol)
+
+		addr, ok := enp.addr.(*net.TCPAddr)
+		if !ok {
+			c.logger.Error("unknown target addr", "addr", enp.addr)
+			return
+		}
+		conn, err := net.DialTCP(enp.config.Protocol, nil, addr)
 		if err != nil {
 			c.logger.Error("unable to dial target", "error", err)
 			return
@@ -242,10 +263,26 @@ func (c *Client) handleUpstreamStream(up *Upstream, ss *smux.Stream) {
 		if err != nil {
 			c.logger.Error("proxy conn error", "error", err)
 		}
+
+		c.logger.Debug("handle request done", "endpoint", enp.config.Name, "upstream_addr",
+			up.config.Addr, "local_addr", enp.config.TargetAddr, "protocol", enp.config.Protocol,
+			"cost", time.Now().Sub(t))
 	case ServerRequestOperationTestBandwidth:
+		c.logger.Debug("bandwidth cap test start", "endpoint", enp.config.Name, "upstream_addr",
+			up.config.Addr, "protocol", enp.config.Protocol)
+
 		c.handleTestBandwidth(enp, ss)
+
+		c.logger.Debug("bandwidth cap test end", "endpoint", enp.config.Name, "upstream_addr",
+			up.config.Addr, "protocol", enp.config.Protocol)
 	case ServerRequestOperationSetupConn:
+		c.logger.Debug("setup conn start", "endpoint", enp.config.Name, "upstream_addr",
+			up.config.Addr, "protocol", enp.config.Protocol)
+
 		c.eh.Emit(EventTypeClientSetupConn, &eventClientSetupConn{upstream: up})
+
+		c.logger.Debug("setup conn end", "endpoint", enp.config.Name, "upstream_addr",
+			up.config.Addr, "protocol", enp.config.Protocol)
 	default:
 		c.logger.Error("unknown server request operation", "error", ErrUnknownServerRequestOperation, "operation", req.Op)
 	}
@@ -254,23 +291,42 @@ func (c *Client) handleUpstreamStream(up *Upstream, ss *smux.Stream) {
 	return
 }
 
-func (c *Client) handleUpstreamConn(up *Upstream, uc *UpstreamConn) (err error) {
+func (c *Client) handleUpstreamConn(ctx context.Context, up *Upstream, uc *UpstreamConn) (err error) {
+	var retries int
+out:
 	for {
-		stream, er := uc.Session.AcceptStream()
-		if er != nil {
-			if uc.Session.IsClosed() || err == io.EOF {
-				c.logger.Debug("accept session closed, return")
-				err = errors.New("upstream session is closed")
-				return
+		select {
+		case <-ctx.Done():
+			err := uc.Session.Close()
+			if err != nil {
+				c.logger.Warn("close upstream session error", "error", err)
 			}
 
-			c.logger.Error("unable to accept stream", "error", er)
-			time.Sleep(time.Millisecond * 10)
-			continue
-		}
+			break out
+		default:
+			stream, er := uc.Session.AcceptStream()
+			if er != nil {
+				retries++
+				if uc.Session.IsClosed() || er == io.EOF {
+					c.logger.Debug("accept session closed, return")
+					err = errors.New("upstream session is closed")
+					return
+				}
+				if retries > ClientMaxAcceptConsecutiveErrors {
+					err = errors.New("upstream max retries reached, reconnect")
+					return
+				}
 
-		go c.handleUpstreamStream(up, stream)
+				c.logger.Error("unable to accept stream", "error", er)
+				time.Sleep(time.Millisecond * 10)
+				continue
+			}
+			retries = 0
+
+			go c.handleUpstreamStream(up, stream)
+		}
 	}
+	return
 }
 
 func (c *Client) Close() {
@@ -293,7 +349,7 @@ func (c *Client) Close() {
 	return
 }
 
-func (c *Client) handleUpstream(up *Upstream) (err error) {
+func (c *Client) handleUpstream(ctx context.Context, up *Upstream) (err error) {
 	var (
 		failed int
 		er     error
@@ -305,7 +361,7 @@ func (c *Client) handleUpstream(up *Upstream) (err error) {
 			continue
 		}
 	}
-	if failed == c.config.Client.ConnPoolSize {
+	if failed >= c.config.Client.ConnPoolSize {
 		err = fmt.Errorf("handle whole upstream %s error: %w", up.config.Name, er)
 		return
 	}
@@ -315,30 +371,38 @@ func (c *Client) handleUpstream(up *Upstream) (err error) {
 		wg.Add(1)
 
 		go func(up *Upstream, uc *UpstreamConn) {
-			wg.Done()
+			defer wg.Done()
 
+		out:
 			for {
-				er := c.handleUpstreamConn(up, uc)
-				if er == nil {
-					// SHOULD NEVER HAPPEN NOW
-					c.logger.Error("handle upstream conn exit without error")
-					break
-				}
+				select {
+				case <-ctx.Done():
+					break out
+				default:
+					er := c.handleUpstreamConn(ctx, up, uc)
+					if er == nil {
+						// SHOULD NEVER HAPPEN NOW
+						c.logger.Error("handle upstream conn exit without error")
+						break
+					}
 
-				// cleanup
-				er = uc.Session.Close()
-				if er != nil {
-					c.logger.Debug("clean up upstream session error", "error", er)
-				}
-				er = uc.Conn.Close()
-				if er != nil {
-					c.logger.Debug("clean up upstream conn error", "error", er)
-				}
+					// cleanup
+					er = uc.Session.Close()
+					if er != nil {
+						c.logger.Debug("clean up upstream session error", "error", er, "upstream", up.config.Name)
+					}
+					er = uc.Conn.Close()
+					if er != nil {
+						c.logger.Debug("clean up upstream conn error", "error", er, "upstream", up.config.Name)
+					}
 
-				er = c.trySetupUpstreamConn(up)
-				if er != nil {
-					c.logger.Error("setup upstream max retries reached, abort", "error", er)
-					break
+					c.logger.Info("try to reconnect upstream", "upstream", up.config.Name, "endpoints",
+						up.config.Endpoints)
+					er = c.trySetupUpstreamConn(up)
+					if er != nil {
+						c.logger.Error("setup upstream max retries reached, abort", "error", er)
+						break
+					}
 				}
 			}
 		}(up, uc)
@@ -347,10 +411,17 @@ func (c *Client) handleUpstream(up *Upstream) (err error) {
 	return
 }
 
-func (c *Client) Run() (err error) {
-	c.initEndpoint()
+func (c *Client) Run(ctx context.Context) (err error) {
+	c.logger.Info("client is preparing")
+
+	err = c.initEndpoint()
+	if err != nil {
+		err = fmt.Errorf("run client error: %w", err)
+		return err
+	}
 	c.initUpstream()
 	c.initEventHub()
+	go c.eh.Run(ctx)
 
 	var wg sync.WaitGroup
 	for _, up := range c.us {
@@ -359,14 +430,15 @@ func (c *Client) Run() (err error) {
 		go func(up *Upstream) {
 			defer wg.Done()
 
-			er := c.handleUpstream(up)
+			er := c.handleUpstream(ctx, up)
 			if er != nil {
 				c.logger.Error("upstream handle error", "upstream", up.config.Name, "error", er)
 				return
 			}
 		}(up)
 	}
-	c.logger.Info("running")
+
+	c.logger.Info("client is running")
 	wg.Wait()
 	return
 }

@@ -5,7 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
+	_ "net/http/pprof"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/davecgh/go-spew/spew"
 )
@@ -44,14 +50,35 @@ func main() {
 		fmt.Print(spew.Sdump(config))
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		timer := time.NewTimer(time.Second * 5)
+		<-timer.C
+		defaultLogger.Info("cleanup timeout, exit")
+		os.Exit(0)
+	}()
+
+	if config.HttpPprofAddr != "" {
+		go func() {
+			defaultLogger.Debug("http pprof is running", "addr", config.HttpPprofAddr)
+			err := http.ListenAndServe(config.HttpPprofAddr, nil)
+			if err != nil {
+				defaultLogger.Warn("http pprof error", "error", err)
+				return
+			}
+		}()
+	}
+
 	switch strings.ToUpper(config.Role) {
 	case "SERVER":
 		s := NewServer(config, defaultLogger)
 		err = s.Run(ctx)
 	case "CLIENT":
 		c := NewClient(config, defaultLogger)
-		err = c.Run()
+		err = c.Run(ctx)
 	default:
 		defaultLogger.Error("unknown role in config", "role", config.Role)
 	}

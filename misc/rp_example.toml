@@ -1,5 +1,6 @@
 role = "client"
 log_level = "info"
+http_pprof_addr = "localhost:6060" # disable if empty
 
 [server]
 protocol = "tcp"
