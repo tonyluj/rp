@@ -297,11 +297,6 @@ out:
 	for {
 		select {
 		case <-ctx.Done():
-			err := uc.Session.Close()
-			if err != nil {
-				c.logger.Warn("close upstream session error", "error", err)
-			}
-
 			break out
 		default:
 			stream, er := uc.Session.AcceptStream()
@@ -329,16 +324,19 @@ out:
 	return
 }
 
-func (c *Client) Close() {
+func (c *Client) clean(ctx context.Context) {
+	<-ctx.Done()
+
 	for _, up := range c.us {
 		up.mu.Lock()
 		for _, uc := range up.uc {
-			err := uc.Conn.Close()
+			err := uc.Session.Close()
 			if err != nil {
 				c.logger.Error("close upstream error", "error", err)
 				continue
 			}
-			err = uc.Session.Close()
+
+			err = uc.Conn.Close()
 			if err != nil {
 				c.logger.Error("close upstream error", "error", err)
 				continue
@@ -422,6 +420,7 @@ func (c *Client) Run(ctx context.Context) (err error) {
 	c.initUpstream()
 	c.initEventHub()
 	go c.eh.Run(ctx)
+	go c.clean(ctx)
 
 	var wg sync.WaitGroup
 	for _, up := range c.us {

@@ -199,6 +199,7 @@ func (dc *downstreamConn) UpdateState(state DownstreamConnState) {
 
 type serverEndpoint struct {
 	config *EndpointConfig
+	l      net.Listener
 }
 
 func NewServer(config Config, logger *slog.Logger) (server *Server) {
@@ -244,6 +245,7 @@ out:
 				s.logger.Warn("close downstream listener error", "error", err)
 			}
 
+			s.logger.Debug("close downstream listener")
 			break out
 		default:
 			conn, err := s.listener.Accept()
@@ -280,6 +282,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	go s.eh.Run(ctx)
 	go s.doDownstreamListener(ctx)
 	go s.downstreamWatchdog(ctx)
+	go s.clean(ctx)
 
 	if s.config.Server.DownstreamSelectionStrategy == DownstreamSelectionStrategyBandwidth.String() {
 		go s.calculateDownstreamBandwidth()
@@ -685,31 +688,20 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerReques
 }
 
 func (s *Server) handleEndpointTcp(ctx context.Context, endpoint *serverEndpoint) {
-	l, err := net.Listen(endpoint.config.Protocol, endpoint.config.ListenAddr)
+	var err error
+	endpoint.l, err = net.Listen(endpoint.config.Protocol, endpoint.config.ListenAddr)
 	if err != nil {
 		s.logger.Error("server handle endpoint error", "error", err)
 		return
 	}
-	defer func(l net.Listener) {
-		err := l.Close()
-		if err != nil {
-			s.logger.Error("server close endpoint listener error", "error", err)
-			return
-		}
-	}(l)
 
 out:
 	for {
 		select {
 		case <-ctx.Done():
-			err := l.Close()
-			if err != nil {
-				s.logger.Warn("close endpoint listener error", "error", err)
-			}
-
 			break out
 		default:
-			conn, err := l.Accept()
+			conn, err := endpoint.l.Accept()
 			if err != nil {
 				s.logger.Error("server handle endpoint error", "error", err)
 
@@ -720,6 +712,19 @@ out:
 			go s.handleUpstreamTcpConn(endpoint, ServerRequestOperationConnect, conn)
 		}
 	}
+}
+
+func (s *Server) clean(ctx context.Context) {
+	<-ctx.Done()
+
+	s.se.Range(func(_ string, endpoint *serverEndpoint) bool {
+		err := endpoint.l.Close()
+		if err != nil {
+			s.logger.Debug("cleanup endpoint listen error", "error", err)
+		}
+
+		return true
+	})
 }
 
 func (s *Server) handleEndpoint(ctx context.Context, endpoint *serverEndpoint) {
