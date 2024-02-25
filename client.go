@@ -105,25 +105,46 @@ func (c *Client) initConn(up *Upstream) (conn net.Conn, err error) {
 	return
 }
 
-func (c *Client) trySetupUpstreamConn(up *Upstream) (err error) {
+func (c *Client) tryRecoverUpstreamConn(up *Upstream) (uc *UpstreamConn, err error) {
 	for tries := 0; tries < up.config.MaxRetries+1; tries++ {
-		err = c.setupUpstreamConn(up)
+		uc, err = c.setupUpstreamConn(up)
 		if err != nil {
 			time.Sleep(time.Second * time.Duration(up.config.RetryInterval))
 			continue
 		}
 		break
 	}
-	if err != nil {
-		err = fmt.Errorf("try setup upstream conn error: %w", err)
+	if uc == nil {
+		err = fmt.Errorf("try recover upstream conn error: %w", err)
 		return
 	}
 
 	return
 }
 
-func (c *Client) setupUpstreamConn(up *Upstream) (err error) {
-	uc := new(UpstreamConn)
+func (c *Client) trySetupUpstreamConn(up *Upstream) (err error) {
+	var uc *UpstreamConn
+	for tries := 0; tries < up.config.MaxRetries+1; tries++ {
+		uc, err = c.setupUpstreamConn(up)
+		if err != nil {
+			time.Sleep(time.Second * time.Duration(up.config.RetryInterval))
+			continue
+		}
+		break
+	}
+	if uc == nil {
+		err = fmt.Errorf("try setup upstream conn error: %w", err)
+		return
+	}
+
+	up.mu.Lock()
+	up.uc = append(up.uc, uc)
+	up.mu.Unlock()
+	return
+}
+
+func (c *Client) setupUpstreamConn(up *Upstream) (uc *UpstreamConn, err error) {
+	uc = new(UpstreamConn)
 	uc.Conn, err = c.initConn(up)
 	if err != nil {
 		goto out
@@ -147,22 +168,18 @@ func (c *Client) setupUpstreamConn(up *Upstream) (err error) {
 		goto cleanSession
 	}
 
-	up.mu.Lock()
-	up.uc = append(up.uc, uc)
-	up.mu.Unlock()
 	return
 
 cleanSession:
 	if er := uc.Session.Close(); er != nil {
 		c.logger.Debug("clean up conn session error", "error", er)
-		return err
 	}
 cleanConn:
 	if er := uc.Conn.Close(); er != nil {
 		c.logger.Debug("clean up conn error", "error", er)
-		return err
 	}
 out:
+	uc = nil
 	err = fmt.Errorf("setup upstream conn error: %w", err)
 	return
 }
@@ -347,6 +364,54 @@ func (c *Client) clean(ctx context.Context) {
 	return
 }
 
+func (c *Client) doUpstreamConn(ctx context.Context, up *Upstream, uc *UpstreamConn) {
+out:
+	for {
+		select {
+		case <-ctx.Done():
+			break out
+		default:
+			er := c.handleUpstreamConn(ctx, up, uc)
+			if er == nil {
+				// SHOULD NEVER HAPPEN NOW
+				c.logger.Error("handle upstream conn exit without error")
+				break
+			}
+
+			// cleanup
+			er = uc.Session.Close()
+			if er != nil {
+				c.logger.Debug("clean up upstream session error", "error", er, "upstream", up.config.Name)
+			}
+			uc.Conn = nil
+			er = uc.Conn.Close()
+			if er != nil {
+				c.logger.Debug("clean up upstream conn error", "error", er, "upstream", up.config.Name)
+			}
+			uc.Session = nil
+
+			c.logger.Info("try to reconnect upstream", "upstream", up.config.Name, "endpoints",
+				up.config.Endpoints)
+
+			ou := uc // store old uc
+			uc, er = c.tryRecoverUpstreamConn(up)
+			if er != nil {
+				c.logger.Error("setup upstream max retries reached, abort", "error", er)
+				break
+			}
+			// replace with new uc
+			up.mu.Lock()
+			for i, tmp := range up.uc {
+				if tmp == ou {
+					up.uc[i] = uc
+					break
+				}
+			}
+			up.mu.Unlock()
+		}
+	}
+}
+
 func (c *Client) handleUpstream(ctx context.Context, up *Upstream) (err error) {
 	var (
 		failed int
@@ -371,38 +436,7 @@ func (c *Client) handleUpstream(ctx context.Context, up *Upstream) (err error) {
 		go func(up *Upstream, uc *UpstreamConn) {
 			defer wg.Done()
 
-		out:
-			for {
-				select {
-				case <-ctx.Done():
-					break out
-				default:
-					er := c.handleUpstreamConn(ctx, up, uc)
-					if er == nil {
-						// SHOULD NEVER HAPPEN NOW
-						c.logger.Error("handle upstream conn exit without error")
-						break
-					}
-
-					// cleanup
-					er = uc.Session.Close()
-					if er != nil {
-						c.logger.Debug("clean up upstream session error", "error", er, "upstream", up.config.Name)
-					}
-					er = uc.Conn.Close()
-					if er != nil {
-						c.logger.Debug("clean up upstream conn error", "error", er, "upstream", up.config.Name)
-					}
-
-					c.logger.Info("try to reconnect upstream", "upstream", up.config.Name, "endpoints",
-						up.config.Endpoints)
-					er = c.trySetupUpstreamConn(up)
-					if er != nil {
-						c.logger.Error("setup upstream max retries reached, abort", "error", er)
-						break
-					}
-				}
-			}
+			c.doUpstreamConn(ctx, up, uc)
 		}(up, uc)
 	}
 	wg.Wait()

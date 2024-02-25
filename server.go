@@ -668,7 +668,7 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerReques
 		dc.proxier = NewProxier(conn, ss) // MUST: conn is B, ss is A
 		err = dc.proxier.Proxy()
 		if err != nil {
-			s.logger.Error("proxy conn error", "error", err)
+			s.logger.Warn("proxy conn error", "error", err)
 		}
 
 		s.logger.Debug("handle request done", "endpoint", endpoint.config.Name, "downstream_addr",
