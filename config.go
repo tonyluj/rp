@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"os"
 
 	"github.com/BurntSushi/toml"
@@ -14,7 +13,6 @@ import (
 const (
 	DefaultConnPoolSize = 16
 
-	ClientDialUpstreamMaxRetries    = 15
 	ClientDialUpstreamRetryInterval = 5
 
 	RoleClient = "client"
@@ -46,7 +44,6 @@ type ClientUpstreamConfig struct {
 	Name          string   `toml:"name"`
 	Protocol      string   `toml:"protocol"`
 	Addr          string   `toml:"addr"`
-	MaxRetries    int      `toml:"max_retries"`
 	RetryInterval int      `toml:"retry_interval"`
 	Endpoints     []string `toml:"endpoints"`
 }
@@ -202,14 +199,6 @@ func ParseConfig(configFile, role, logLevel string) (config Config, err error) {
 				return
 			}
 			// correct retries
-			if up.MaxRetries == 0 {
-				up.MaxRetries = ClientDialUpstreamMaxRetries
-			} else if up.MaxRetries == -1 {
-				up.MaxRetries = math.MaxInt
-			} else if up.MaxRetries < -1 {
-				err = errors.New("unavailable max retries")
-				return
-			}
 			if up.RetryInterval == 0 {
 				up.RetryInterval = ClientDialUpstreamRetryInterval
 			}
