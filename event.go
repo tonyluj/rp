@@ -39,8 +39,6 @@ out:
 	for {
 		select {
 		case event := <-eh.events:
-			eh.logger.Debug("start to handle event", "type", event.Type)
-
 			handler, ok := eh.handlers.Load(event.Type)
 			if !ok {
 				eh.logger.Warn("unknown event type, drop it", "type", event.Type)
@@ -52,8 +50,6 @@ out:
 				eh.logger.Error("handle event error", "type", event.Type, "error", err)
 				continue
 			}
-
-			eh.logger.Debug("handle event done", "type", event.Type)
 		case <-ctx.Done():
 			eh.logger.Debug("event hub context exceeded, exit")
 			break out

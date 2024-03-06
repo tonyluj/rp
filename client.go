@@ -17,9 +17,7 @@ import (
 
 const (
 	ClientMaxAcceptConsecutiveErrors = 8
-)
 
-const (
 	EventTypeClientSetupConn EventType = "EVENT_TYPE_CLIENT_SETUP_CONN"
 )
 
@@ -28,6 +26,12 @@ type eventClientSetupConn struct {
 }
 
 type RegisterDownstreamRequest struct {
+	UUID      [16]byte // for unique ID for server side
+	Endpoints []string // slice of endpoint name
+}
+
+type RegisterDownstreamResponse struct {
+	State     uint8    // 0 for failed, 1 for ok
 	UUID      [16]byte // for unique ID for server side
 	Endpoints []string // slice of endpoint name
 }
@@ -78,7 +82,7 @@ func NewClient(config Config, logger *slog.Logger) (client *Client) {
 }
 
 func (c *Client) initEventHub() {
-	c.eh.RegisterHandler(EventTypeServerSetupConn, c.handleSetupConn, false)
+	c.eh.RegisterHandler(EventTypeClientSetupConn, c.handleSetupConn, false)
 }
 
 func (c *Client) handleSetupConn(payload any) (err error) {
@@ -135,60 +139,87 @@ func (c *Client) trySetupUpstreamConn(up *Upstream) (err error) {
 	return
 }
 
+func (c *Client) closeWithError(closer io.Closer) {
+	err := closer.Close()
+	if err != nil {
+		c.logger.Debug("close error", "error", err)
+		return
+	}
+}
+
 func (c *Client) setupUpstreamConn(up *Upstream) (uc *UpstreamConn, err error) {
+	var stream *smux.Stream
+
 	uc = new(UpstreamConn)
 	uc.Conn, err = c.initConn(up)
 	if err != nil {
-		goto out
+		err = fmt.Errorf("setup upstream conn error: %w", err)
+		return
 	}
 
 	uc.Session, err = smux.Server(uc.Conn, &smux.Config{
 		Version:           2,
 		KeepAliveDisabled: false,
-		KeepAliveInterval: time.Second * 15,
-		KeepAliveTimeout:  time.Second * 30,
+		KeepAliveInterval: time.Second * 10,
+		KeepAliveTimeout:  time.Second * 10,
 		MaxFrameSize:      32 * 1024,
 		MaxReceiveBuffer:  512 * 1024,
 		MaxStreamBuffer:   512 * 1024,
 	})
 	if err != nil {
-		goto cleanConn
+		c.closeWithError(uc.Conn)
+		uc = nil
+		err = fmt.Errorf("setup upstream conn error: %w", err)
+		return
 	}
 
-	err = c.registerUpstreamConnEndpoint(up, uc)
+	stream, err = uc.Session.AcceptStream()
 	if err != nil {
-		goto cleanSession
+		c.closeWithError(uc.Session)
+		c.closeWithError(uc.Conn)
+		uc = nil
+		err = fmt.Errorf("setup upstream conn error: %w", err)
+		return
+	}
+	defer c.closeWithError(stream)
+
+	err = c.registerUpstreamConnEndpoint(up, stream)
+	if err != nil {
+		c.closeWithError(uc.Session)
+		c.closeWithError(uc.Conn)
+		uc = nil
+		err = fmt.Errorf("setup upstream conn error: %w", err)
+		return
 	}
 
-	return
-
-cleanSession:
-	if er := uc.Session.Close(); er != nil {
-		c.logger.Debug("clean up conn session error", "error", er)
-	}
-cleanConn:
-	if er := uc.Conn.Close(); er != nil {
-		c.logger.Debug("clean up conn error", "error", er)
-	}
-out:
-	uc = nil
-	err = fmt.Errorf("setup upstream conn error: %w", err)
 	return
 }
 
-func (c *Client) registerUpstreamConnEndpoint(up *Upstream, uc *UpstreamConn) (err error) {
+func (c *Client) registerUpstreamConnEndpoint(up *Upstream, stream *smux.Stream) (err error) {
 	req := RegisterDownstreamRequest{
 		UUID:      c.uuid,
 		Endpoints: up.config.Endpoints,
 	}
 
-	err = gob.NewEncoder(uc.Conn).Encode(req)
+	err = gob.NewEncoder(stream).Encode(req)
 	if err != nil {
 		err = fmt.Errorf("unable to register endpint: %w", err)
 		return
 	}
 
-	c.logger.Debug("register done", "local_addr", uc.Conn.LocalAddr(), "remote_addr", uc.Conn.RemoteAddr())
+	var resp RegisterDownstreamResponse
+	err = gob.NewDecoder(stream).Decode(&resp)
+	if err != nil {
+		err = fmt.Errorf("bad response, unable to register endpint: %w", err)
+		return
+	}
+
+	if resp.State != 1 || resp.UUID != req.UUID {
+		err = fmt.Errorf("unknown response, unable to register endpint: %w", err)
+		return
+	}
+
+	c.logger.Debug("register done", "upstream", up.config.Name)
 	return
 }
 
@@ -358,7 +389,7 @@ func (c *Client) clean(ctx context.Context) {
 }
 
 func (c *Client) cleanStreamConn(up *Upstream, uc *UpstreamConn) {
-	if uc == nil {
+	if uc == nil || up == nil {
 		return
 	}
 
@@ -366,13 +397,13 @@ func (c *Client) cleanStreamConn(up *Upstream, uc *UpstreamConn) {
 	if err != nil {
 		c.logger.Debug("clean up upstream session error", "error", err, "upstream", up.config.Name)
 	}
-	uc.Conn = nil
+	uc.Session = nil
 
 	err = uc.Conn.Close()
 	if err != nil {
 		c.logger.Debug("clean up upstream conn error", "error", err, "upstream", up.config.Name)
 	}
-	uc.Session = nil
+	uc.Conn = nil
 
 	return
 }
@@ -384,19 +415,19 @@ out:
 		case <-ctx.Done():
 			break out
 		default:
-			er := c.handleUpstreamConn(ctx, up, uc)
-			if er == nil {
+			err := c.handleUpstreamConn(ctx, up, uc)
+			if err == nil {
 				// context reached, exit
 				break
 			}
 
 			c.logger.Info("try to reconnect upstream", "upstream", up.config.Name, "endpoints",
-				up.config.Endpoints)
+				up.config.Endpoints, "error", err)
 
 			c.cleanStreamConn(up, uc)
-			nuc, er := c.tryRecoverUpstreamConn(up)
-			if er != nil {
-				c.logger.Error("setup upstream max retries reached, abort", "error", er)
+			nuc, err := c.tryRecoverUpstreamConn(up)
+			if err != nil {
+				c.logger.Error("setup upstream max retries reached, abort", "error", err)
 				break
 			}
 			uc.Session = nuc.Session

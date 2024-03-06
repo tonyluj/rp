@@ -14,7 +14,6 @@ conn_pool_size = 8
 name = "sh-tonylu-cloud" # unique name for client-side
 protocol = "tcp"
 addr = "example.com:8022"
-max_retries = 30 # -1 for infinity
 retry_interval = 5 # in secound
 endpoints = [ "*" ]  # registerd endpoint, "*" means all, empty is not allowed
 

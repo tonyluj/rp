@@ -73,7 +73,6 @@ type eventServerSetupConn struct {
 }
 
 type eventServerRegisterDownstream struct {
-	req  RegisterDownstreamRequest
 	conn net.Conn
 }
 
@@ -145,6 +144,22 @@ func (ds *downstream) checkAndUpdateState() (readyConn, failedConn int) {
 	} else if failedConn < len(ds.dc) {
 		ds.state = DownstreamStatePartialBroken
 	}
+	return
+}
+
+func (ds *downstream) cleanFailedConn() {
+	todo := make([]int, 0, 8)
+	for i, dc := range ds.dc {
+		if dc.state == DownstreamConnStateFailed {
+			todo = append(todo, i)
+		}
+	}
+
+	for i := len(todo) - 1; i >= 0; i-- {
+		index := todo[i]
+		ds.dc = append(ds.dc[:index], ds.dc[index+1:]...)
+	}
+
 	return
 }
 
@@ -256,15 +271,7 @@ out:
 				continue
 			}
 
-			s.logger.Debug("receive downstream register event")
-
 			event := &eventServerRegisterDownstream{conn: conn}
-			err = gob.NewDecoder(conn).Decode(&event.req)
-			if err != nil {
-				err = fmt.Errorf("unable to handle register downstream endpoint: %w", err)
-				return
-			}
-
 			s.eh.Emit(EventTypeServerRegisterDownstream, event)
 		}
 	}
@@ -355,8 +362,8 @@ func (s *Server) registerDownstreamEndpoint(data any) (err error) {
 	session, err := smux.Client(event.conn, &smux.Config{
 		Version:           2,
 		KeepAliveDisabled: false,
-		KeepAliveInterval: time.Second * 15,
-		KeepAliveTimeout:  time.Second * 30,
+		KeepAliveInterval: time.Second * 10,
+		KeepAliveTimeout:  time.Second * 10,
 		MaxFrameSize:      32 * 1024,
 		MaxReceiveBuffer:  512 * 1024,
 		MaxStreamBuffer:   512 * 1024,
@@ -366,17 +373,48 @@ func (s *Server) registerDownstreamEndpoint(data any) (err error) {
 		return
 	}
 
-	ds, ok := s.ds.Load(event.req.UUID)
+	stream, err := session.OpenStream()
+	if err != nil {
+		err = fmt.Errorf("unable to handle register downstream endpoint: %w", err)
+		return
+	}
+	defer func(stream *smux.Stream) {
+		er := stream.Close()
+		if er != nil {
+			s.logger.Debug("close stream error", "error", er)
+			return
+		}
+	}(stream)
+
+	var req RegisterDownstreamRequest
+	err = gob.NewDecoder(stream).Decode(&req)
+	if err != nil {
+		err = fmt.Errorf("unable to handle register downstream endpoint: %w", err)
+		return
+	}
+
+	resp := RegisterDownstreamResponse{
+		State:     1,
+		UUID:      req.UUID,
+		Endpoints: req.Endpoints,
+	}
+	err = gob.NewEncoder(stream).Encode(resp)
+	if err != nil {
+		err = fmt.Errorf("unable to confirm register downstream endpoint: %w", err)
+		return
+	}
+
+	ds, ok := s.ds.Load(req.UUID)
 	if !ok {
 		ds = &downstream{
 			state:               DownstreamStateOk,
-			uuid:                event.req.UUID,
-			endpointName:        event.req.Endpoints,
+			uuid:                req.UUID,
+			endpointName:        req.Endpoints,
 			dc:                  make([]*downstreamConn, 0, 8),
 			lastRecover:         time.Now(),
 			bandwidthLastUpdate: time.Now(),
 		}
-		s.ds.Store(event.req.UUID, ds)
+		s.ds.Store(req.UUID, ds)
 	}
 
 	dc := &downstreamConn{
@@ -393,7 +431,7 @@ func (s *Server) registerDownstreamEndpoint(data any) (err error) {
 	// update downstream state when new connection added
 	ds.CheckAndUpdateState()
 
-	s.logger.Info("register downstream done", "addr", dc.conn.RemoteAddr(), "endpoints", event.req.Endpoints)
+	s.logger.Info("register downstream done", "addr", dc.conn.RemoteAddr(), "endpoints", req.Endpoints)
 	return
 }
 
@@ -435,7 +473,7 @@ out:
 		case <-ticker.C:
 			s.ds.Range(func(_ uuid.UUID, ds *downstream) bool {
 				if dsState := ds.CheckAndUpdateState(); !dsState.IsOk() {
-					s.logger.Debug("downstream watchdog detect failed", "downstream", ds.uuid.String())
+					s.logger.Warn("downstream watchdog detect failed", "downstream", ds.uuid.String())
 					s.eh.Emit(EventTypeServerSetupConn, &eventServerSetupConn{ds: ds})
 				}
 
@@ -455,6 +493,9 @@ func (s *Server) recoverDownstream(ds *downstream) (err error) {
 		return
 	}
 
+	// clean up failed conn in ds.dc
+	ds.cleanFailedConn()
+
 	var succeed int
 	for range failed {
 		er := s.recoverDownstreamConn(ds)
@@ -465,7 +506,7 @@ func (s *Server) recoverDownstream(ds *downstream) (err error) {
 		succeed++
 	}
 
-	s.logger.Info("recover downstream done", "total", failed, "succeed", succeed)
+	s.logger.Info("recover downstream done, wait client reconnect", "total", failed, "succeed", succeed)
 	return
 }
 
@@ -481,7 +522,7 @@ func (s *Server) recoverDownstreamConn(ds *downstream) (err error) {
 			continue
 		}
 
-		er = s.sendRequest("", ServerRequestOperationSetupConn, ss)
+		er = s.sendRequest(ds.endpointName[0], ServerRequestOperationSetupConn, ss)
 		if er != nil {
 			if er2 := ss.Close(); er2 != nil {
 				s.logger.Debug("recover downstream stream close error", "error", er2)
