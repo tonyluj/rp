@@ -254,13 +254,7 @@ func (c *Client) initUpstream() {
 }
 
 func (c *Client) handleUpstreamStream(up *Upstream, ss *smux.Stream) {
-	defer func() {
-		err := ss.Close()
-		if err != nil {
-			c.logger.Debug("close upstream stream error", "error", err)
-			return
-		}
-	}()
+	defer c.closeWithError(ss)
 
 	// handshake
 	var req ServerRequestEndpoint
@@ -291,13 +285,7 @@ func (c *Client) handleUpstreamStream(up *Upstream, ss *smux.Stream) {
 			c.logger.Error("unable to dial target", "error", err)
 			return
 		}
-		defer func(conn net.Conn) {
-			err := conn.Close()
-			if err != nil {
-				c.logger.Debug("close upstream stream error", "error", err)
-				return
-			}
-		}(conn)
+		defer c.closeWithError(conn)
 
 		err = NewProxier(conn, ss).Proxy()
 		if err != nil {

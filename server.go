@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net"
@@ -378,13 +379,7 @@ func (s *Server) registerDownstreamEndpoint(data any) (err error) {
 		err = fmt.Errorf("unable to handle register downstream endpoint: %w", err)
 		return
 	}
-	defer func(stream *smux.Stream) {
-		er := stream.Close()
-		if er != nil {
-			s.logger.Debug("close stream error", "error", er)
-			return
-		}
-	}(stream)
+	defer s.closeWithError(stream)
 
 	var req RegisterDownstreamRequest
 	err = gob.NewDecoder(stream).Decode(&req)
@@ -524,18 +519,14 @@ func (s *Server) recoverDownstreamConn(ds *downstream) (err error) {
 
 		er = s.sendRequest(ds.endpointName[0], ServerRequestOperationSetupConn, ss)
 		if er != nil {
-			if er2 := ss.Close(); er2 != nil {
-				s.logger.Debug("recover downstream stream close error", "error", er2)
-			}
+			s.closeWithError(ss)
 
 			dc.load.Dec()
 			err = fmt.Errorf("recover downstream error: %w", er)
 			continue
 		}
 
-		if er := ss.Close(); er != nil {
-			s.logger.Debug("recover downstream stream close error", "error", er)
-		}
+		s.closeWithError(ss)
 		dc.load.Dec()
 		break
 	}
@@ -662,15 +653,9 @@ func (s *Server) sendRequest(name string, op ServerRequestOperation, ss *smux.St
 }
 
 func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerRequestOperation, conn net.Conn) {
-	defer func(conn net.Conn) {
-		if conn != nil {
-			err := conn.Close()
-			if err != nil {
-				s.logger.Debug("close conn error", "error", err)
-				return
-			}
-		}
-	}(conn)
+	if conn != nil {
+		defer s.closeWithError(conn)
+	}
 
 	dc, ss, err := s.setupStream(endpoint.config.Name)
 	if err != nil {
@@ -687,11 +672,7 @@ func (s *Server) handleUpstreamTcpConn(endpoint *serverEndpoint, op ServerReques
 	}
 	defer func(dc *downstreamConn, ss *smux.Stream) {
 		dc.load.Dec()
-		err := ss.Close()
-		if err != nil {
-			s.logger.Debug("close stream error", "error", err)
-			return
-		}
+		s.closeWithError(ss)
 	}(dc, ss)
 
 	err = s.sendRequest(endpoint.config.Name, op, ss)
@@ -805,4 +786,12 @@ func (s *Server) testBandwidth(ds *downstream, conn net.Conn) {
 	}
 	ds.bandwidthCap = int64(float64(written) / costTime.Seconds())
 	return
+}
+
+func (s *Server) closeWithError(closer io.Closer) {
+	err := closer.Close()
+	if err != nil {
+		s.logger.Error("close error", "error", err)
+		return
+	}
 }
